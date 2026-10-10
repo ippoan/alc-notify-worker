@@ -1,0 +1,43 @@
+# notify の配信・宛先の Worker `alc-notify` (Refs ippoan/rust-alc-api#747)。
+# rust-alc-api の crates/alc-notify のうち、配信・宛先・LINE WORKS の口だけを移す (文書の取り込み・PDF 加工は Cloud Run に残る)。
+# 型は ippoan/alc-lineworks-worker と同じ。
+# 直下の package が worker、route の crate は crates/notify (同じ workspace・lock は直下の 1 つ)。
+#
+# 口・SQL は crates/notify に在り、この Worker が持つのは DB への経路 (`src/db.rs`)・workers-rs への載せ方 (`src/lib.rs`) だけ。
+[package]
+name = "alc-notify-worker"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[workspace]
+members = ["crates/notify"]
+
+# alc-core-wasm と alc-worker-db は ippoan/alc-worker-kit から引く。git 依存・rev 固定で、**2 つとも同じ rev**
+# (ippoan/alc-lineworks-worker と同じ rev)。**書くのはここ 1 か所だけ** (worker と crates/notify は `workspace = true` で継承する)。
+# 出どころが 2 つになると `PgClient` (alc-worker-db) や `TenantId` (alc-core-wasm) が別の型になり、
+# コンパイルは通るのに全リクエストが 500 になる。
+# rev を上げるときは 2 つを一緒に上げ、Cargo.lock も一緒に更新する。
+[workspace.dependencies]
+alc-core-wasm = { git = "https://github.com/ippoan/alc-worker-kit", rev = "5a3b749e891a68f026b53b4402e8861d3aeb3639" }
+alc-worker-db = { git = "https://github.com/ippoan/alc-worker-kit", rev = "5a3b749e891a68f026b53b4402e8861d3aeb3639" }
+
+# 使わない依存は入れない
+[dependencies]
+alc-worker-db = { workspace = true }
+axum = { version = "0.8", default-features = false }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+notify = { path = "crates/notify" }
+tokio-postgres = { version = "0.7", default-features = false, features = ["js"] }
+tower-service = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+worker = { version = "0.8", features = ["http", "axum", "tokio-postgres"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1

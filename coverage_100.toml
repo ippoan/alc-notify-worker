@@ -1,0 +1,25 @@
+# 行カバレッジ 100% の登録簿 (ippoan/alc-lineworks-worker・ohishi-exp/rust-leave-worker の同名のファイルの形。
+# Refs ippoan/rust-alc-api#747)。
+#
+#   bash scripts/fetch-migrations.sh
+#   NOTIFY_TEST_ADMIN_DATABASE_URL=... cargo llvm-cov --locked -p notify --text > cov-notify.txt
+#   bash scripts/check_coverage_100.sh --use-cache cov-notify.txt
+#
+# 計測するのは `cargo test -p notify` の全部 = tests/recipients_db.rs (口から実 DB まで。接続先が無ければ失敗する)。
+# worker 本体 (直下の src/、wasm 専用) は native で計測できないので対象外。
+
+# tenant の layer と DB の失敗の応答・ログ
+[[files]]
+path = "crates/notify/src/lib.rs"
+
+# SQL を流す 1 か所 (tests/recipients_db.rs が実 DB で通す)
+[[files]]
+path = "crates/notify/src/pg.rs"
+
+# 宛先の口 (CRUD と bulk)
+[[files]]
+path = "crates/notify/src/recipients.rs"
+
+# グループの口 (CRUD とメンバー)
+[[files]]
+path = "crates/notify/src/groups.rs"
