@@ -93,6 +93,13 @@ pub mod sql {
     pub const DELETE_GROUP: &str = "DELETE FROM notify_groups WHERE tenant_id = $1 AND id = $2";
 
     /// 冪等 (既に在る組は飛ばす)。別 tenant の group は RLS の WITH CHECK で断られる
+    /// 足す宛先のうち、この tenant に在るものの数 (`$2` は重複を除いた id)。[`ADD_MEMBERS`] の前に同じ transaction で数える
+    pub const COUNT_TENANT_RECIPIENTS: &str =
+        "SELECT count(*) FROM notify_recipients WHERE tenant_id = $1 AND id = ANY($2)";
+
+    /// 冪等 (既に在る組は飛ばす)。宛先が同じ tenant に在ることは [`COUNT_TENANT_RECIPIENTS`] で先に確かめる
+    /// (RLS の WITH CHECK は group の tenant しか見ず、FK は RLS を通らないので、別 tenant の宛先も入ってしまう)。
+    /// 別 tenant の group は RLS の WITH CHECK で断られる
     pub const ADD_MEMBERS: &str = "INSERT INTO notify_recipient_groups (group_id, recipient_id) \
          SELECT $1, UNNEST($2::uuid[]) ON CONFLICT DO NOTHING";
 
@@ -399,27 +406,55 @@ pub async fn delete_group(pg: &mut PgClient, tenant_id: Uuid, id: Uuid) -> Resul
     .await
 }
 
-/// 空なら DB に触らない (rust と同じ)
+/// [`add_members`] の失敗
+#[derive(Debug)]
+pub enum AddMembersError {
+    /// 足す宛先のどれかが、この tenant に無い (別 tenant・存在しない)。何も足さない
+    RecipientNotFound,
+    Db(Error),
+}
+
+/// 宛先をグループに足す。**宛先がすべてこの tenant に在るときだけ**足し、1 つでも無ければ何も足さずに
+/// [`AddMembersError::RecipientNotFound`] (rust はここを検査せず、別 tenant の宛先も入った)。空なら DB に触らない (rust と同じ)
 pub async fn add_members(
     pg: &mut PgClient,
     tenant_id: Uuid,
     group_id: Uuid,
-    recipient_ids: Vec<Uuid>,
-) -> Result<(), Error> {
+    mut recipient_ids: Vec<Uuid>,
+) -> Result<(), AddMembersError> {
     if recipient_ids.is_empty() {
         return Ok(());
     }
-    pg.tenant_tx(tenant_id, move |tx| {
-        Box::pin(async move {
-            tx.execute_typed(
-                sql::ADD_MEMBERS,
-                &[(&group_id, Type::UUID), (&recipient_ids, Type::UUID_ARRAY)],
-            )
-            .await?;
-            Ok(())
+    recipient_ids.sort_unstable();
+    recipient_ids.dedup();
+    let added = pg
+        .tenant_tx(tenant_id, move |tx| {
+            Box::pin(async move {
+                let found: i64 = tx
+                    .query_typed_one(
+                        sql::COUNT_TENANT_RECIPIENTS,
+                        &[(&tenant_id, Type::UUID), (&recipient_ids, Type::UUID_ARRAY)],
+                    )
+                    .await?
+                    .get(0);
+                if found != recipient_ids.len() as i64 {
+                    return Ok(false);
+                }
+                tx.execute_typed(
+                    sql::ADD_MEMBERS,
+                    &[(&group_id, Type::UUID), (&recipient_ids, Type::UUID_ARRAY)],
+                )
+                .await?;
+                Ok(true)
+            })
         })
-    })
-    .await
+        .await
+        .map_err(AddMembersError::Db)?;
+    if added {
+        Ok(())
+    } else {
+        Err(AddMembersError::RecipientNotFound)
+    }
 }
 
 pub async fn remove_member(

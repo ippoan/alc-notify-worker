@@ -31,7 +31,7 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
 - DB は `PgClient::tenant_tx` + `query_typed` 系だけ。SQL は `crates/notify/src/pg.rs` の 1 か所。
   名前付き prepared statement 禁止。Row を transaction の外へ持ち出さない (owned な型に `TxOutput`)。
   tenant_id の列が在る表は WHERE にも tenant_id を書く。
-- rust に無い検査 (role など) を足さない。rust と違う振る舞いにするときは理由を書く。
-- `coverage_100.toml` の登録を外さない。CI の本数 (recipients_db 7) はテストを足したら上げる。
+- rust に無い検査 (role など) を足さない。rust と違う振る舞いにするときは理由を書く (いまは 1 つ: members の POST と bulk のグループ追加は、宛先が同じ tenant に無ければ何も足さない。POST は 404。RLS の WITH CHECK が group の tenant しか見ないため)。
+- `coverage_100.toml` の登録を外さない。CI の本数 (recipients_db 8) はテストを足したら上げる。
 - public repo: ホスト名・account ID・tenant UUID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
 - kit の rev は直下 `Cargo.toml` の 1 か所 (alc-lineworks-worker と同じ rev)。

@@ -467,7 +467,8 @@ async fn other_tenant_is_invisible() {
         Some(json!({"recipient_ids": [id(&r)]})),
     )
     .await;
-    assert_eq!(got.status, 500);
+    // other から見て r は無い宛先 → 404 (group の RLS より先に宛先の tenant で断る)
+    assert_eq!(got.status, 404);
     // 別 tenant の bulk は、t の lineworks_user_id と突き合わない (別の行を作る)
     let got = call(
         &app,
@@ -488,6 +489,63 @@ async fn other_tenant_is_invisible() {
     assert_eq!(names(&got.json()), vec!["本人"]);
     let got = call(&app, "GET", RECIPIENTS, Some(t), None).await;
     assert_eq!(names(&got.json()), vec!["本人"]);
+}
+
+async fn member_rows(group: &Value) -> i64 {
+    let g: Uuid = id(group).parse().unwrap();
+    admin()
+        .await
+        .query_one(
+            "SELECT count(*) FROM alc_api.notify_recipient_groups WHERE group_id = $1",
+            &[&g],
+        )
+        .await
+        .unwrap()
+        .get(0)
+}
+
+/// 別 tenant の宛先・存在しない宛先は自分のグループに足せない: 404 (本文なし・ログなし) で、1 つでも混ざれば何も足さない。
+/// rust はここを検査せず、RLS (group の tenant しか見ない) と FK (RLS を通らない) を抜けて別 tenant の宛先が入った
+#[tokio::test]
+async fn add_members_rejects_other_tenant_recipient() {
+    let t = tenant().await;
+    let other = tenant().await;
+    let app = app().await;
+    let mine = create_recipient(&app, t, "自社", "lw-mine").await;
+    let theirs = create_recipient(&app, other, "他社", "lw-theirs").await;
+    let g = create_group(&app, t, "班").await;
+    let members = format!("{GROUPS}/{}/members", id(&g));
+
+    for ids in [
+        json!([id(&theirs)]),
+        json!([id(&mine), id(&theirs)]),
+        json!([id(&mine), Uuid::new_v4()]),
+    ] {
+        let got = call(
+            &app,
+            "POST",
+            &members,
+            Some(t),
+            Some(json!({"recipient_ids": ids})),
+        )
+        .await;
+        assert_eq!((got.status, got.body.len()), (404, 0));
+        assert_eq!(member_rows(&g).await, 0, "行が増えた");
+    }
+    // 同じ id の重複は 1 つとして数える
+    let got = call(
+        &app,
+        "POST",
+        &members,
+        Some(t),
+        Some(json!({"recipient_ids": [id(&mine), id(&mine)]})),
+    )
+    .await;
+    assert_eq!(got.status, 204);
+    assert_eq!(member_rows(&g).await, 1);
+    let got = call(&app, "GET", &members, Some(t), None).await;
+    assert_eq!(names(&got.json()), vec!["自社"]);
+    assert!(app.logs.lock().unwrap().is_empty());
 }
 
 /// X-Tenant-ID が無い・UUID でない → 401。読めない body・method・path は axum の既定 (rust と同じ)

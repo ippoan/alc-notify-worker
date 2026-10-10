@@ -9,7 +9,7 @@
 //! | PUT | `/api/notify/groups/{id}` | 200 直した行 (無ければ 500。rust と同じ) |
 //! | DELETE | `/api/notify/groups/{id}` | 204 (無くても 204) |
 //! | GET | `/api/notify/groups/{id}/members` | 200 メンバーの宛先 (名前の順) |
-//! | POST | `/api/notify/groups/{id}/members` | 204 (`{"recipient_ids": [...]}`、既に在る組は飛ばす) |
+//! | POST | `/api/notify/groups/{id}/members` | 204 (`{"recipient_ids": [...]}`、既に在る組は飛ばす)。宛先が 1 つでもこの tenant に無ければ 404 で何も足さない (rust には無い検査) |
 //! | DELETE | `/api/notify/groups/{id}/members/{recipient_id}` | 204 |
 
 use alc_core_wasm::TenantId;
@@ -21,7 +21,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::pg::{self, CreateNotifyGroup, UpdateNotifyGroup};
+use crate::pg::{self, AddMembersError, CreateNotifyGroup, UpdateNotifyGroup};
 use crate::NotifyState;
 
 pub const GROUPS_PATH: &str = "/api/notify/groups";
@@ -35,6 +35,14 @@ pub fn router() -> Router<NotifyState> {
         .route(GROUP_PATH, get(get_one).put(update).delete(delete_one))
         .route(GROUP_MEMBERS_PATH, get(list_members).post(add_members))
         .route(GROUP_MEMBER_PATH, delete(remove_member))
+}
+
+/// [`pg::add_members`] の失敗の応答: この tenant に無い宛先 → 404 (ログなし)、DB → 500 (bulk の追加も通る)
+pub(crate) fn add_members_fail(state: &NotifyState, what: &str, e: AddMembersError) -> StatusCode {
+    match e {
+        AddMembersError::RecipientNotFound => StatusCode::NOT_FOUND,
+        AddMembersError::Db(e) => state.db_fail(what, &e),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -124,7 +132,7 @@ async fn add_members(
     let mut pg = state.pg.lock().await;
     pg::add_members(&mut pg, tenant.0, id, input.recipient_ids)
         .await
-        .map_err(|e| state.db_fail("add group members", &e))?;
+        .map_err(|e| add_members_fail(&state, "add group members", e))?;
     Ok(StatusCode::NO_CONTENT)
 }
 

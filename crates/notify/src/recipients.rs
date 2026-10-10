@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::pg::{self, CreateNotifyRecipient, UpdateNotifyRecipient};
-use crate::NotifyState;
+use crate::{groups, NotifyState};
 
 pub const RECIPIENTS_PATH: &str = "/api/notify/recipients";
 pub const RECIPIENTS_BULK_PATH: &str = "/api/notify/recipients/bulk";
@@ -104,7 +104,7 @@ async fn bulk_upsert(
 
     for group_id in input.group_ids {
         if let Err(e) = pg::add_members(&mut pg, tenant.0, group_id, touched_ids.clone()).await {
-            state.db_fail("bulk add members", &e);
+            groups::add_members_fail(&state, "bulk add members", e);
         }
     }
 
