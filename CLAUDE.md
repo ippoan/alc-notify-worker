@@ -11,6 +11,8 @@ Cloud Run (rust-alc-api) に残っている。** 型は ippoan/alc-lineworks-wor
 - `/api/notify/line-config` (GET / POST / DELETE。POST は秘密値を `SSO_ENCRYPTION_KEY` で暗号化。GET は暗号文を返さない)
 - `/api/notify/lineworks/channels` (GET)・`/{id}` (DELETE)・`/{id}/test-send` (POST)
 - `/api/notify/lineworks/users` (GET)・`/api/notify/lineworks/login-activity?days=` (GET)
+- `/api/notify/documents/{id}/distribute` (POST)・`/api/notify/test-distribute` (POST) (配信。viewer の Worker
+  (ippoan/nuxt-notify) の `/api/notify/register-view` へ view を登録し、`NOTIFY_FRONTEND_URL` の URL を載せて送る)
 
 LINE WORKS の API はこの worker では叩かず、ippoan/alc-lineworks-worker を Service Binding `ALC_LINEWORKS` で呼ぶ
 (`X-Tenant-ID` 付き。`crates/notify/src/lineworks.rs` の `LineworksApi`、worker の実装は `src/lineworks.rs`)。
@@ -35,7 +37,8 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
 ## 規範
 - 公開範囲を弱めない: 本番・staging とも Service Binding だけ (どの env も `workers_dev`/`preview_urls` = false、route 無し)。
   Hyperdrive (`NOTIFY_HYPERDRIVE`) は本番だけ、staging は VPC (`NOTIFY_DB_VPC`)。`SSO_ENCRYPTION_KEY` (Secrets Store) と
-  `ALC_LINEWORKS` (Service Binding) は両方の env に書く (binding は env に継承されない)。`wrangler.toml` の表の順を変えない
+  `ALC_LINEWORKS` (Service Binding)・`INTERNAL_SHARED_SECRET` (Secrets Store。viewer 登録のヘッダ)・`[vars]`
+  `NOTIFY_FRONTEND_URL` は両方の env に書く (binding も vars も env に継承されない)。`wrangler.toml` の表の順を変えない
   (新しい表は placement より後。`[env.staging]` と `[env.staging.observability]` の間に挟まない)。
 - **ログ・エラー応答は固定の語だけ。** `{e}`・DB の message・識別子 (tenant_id・行 id)・入力の値を出さない。
   DB の失敗は `notify: <段> failed: db (<kind>)` (kind は SQLSTATE か tokio-postgres の種類の label)。
@@ -43,6 +46,9 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
   名前付き prepared statement 禁止。Row を transaction の外へ持ち出さない (owned な型に `TxOutput`)。
   tenant_id の列が在る表は WHERE にも tenant_id を書く。
 - rust に無い検査 (role など) を足さない。rust と違う振る舞いにするときは理由を書く (いまは 2 つ: (1) members の POST と bulk のグループ追加は、宛先が同じ tenant に無ければ何も足さない。POST は 404。RLS の WITH CHECK が group の tenant しか見ないため。(2) LINE WORKS の口の失敗の本文は lineworks-worker の status と語 (`error`・`missing_scope` の `scope`・語の形の `message`) だけを写し、自由文 (rust の 502 の `message`) は載せない。tenant に bot が無いときの語は lineworks-worker の `bot_config_not_found` (rust は `no_lineworks_config`。画面は status しか見ない)。ログに上流の文を出さないため)。
-- `coverage_100.toml` の登録を外さない。CI の本数 (recipients_db 8・lineworks_db 7) はテストを足したら上げる。
+- `coverage_100.toml` の登録を外さない。CI の本数 (recipients_db 8・lineworks_db 7・distribute_db 9。
+  `.github/workflows/ci.yml` の gate) はテストを足したら上げる。
 - public repo: ホスト名・account ID・tenant UUID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
+  例外: 利用者に配る公開の viewer URL `NOTIFY_FRONTEND_URL` は wrangler.toml の `[vars]` に平文で置く
+  (rust-alc-api の Cloud Run・ippoan/nuxt-notify と同じ値)。
 - kit の rev は直下 `Cargo.toml` の 1 か所 (alc-core-wasm・alc-worker-db・alc-worker-crypto を同じ rev で)。
