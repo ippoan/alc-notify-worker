@@ -1,11 +1,13 @@
 //! SQL を流す 1 か所 (`PgClient::tenant_tx` + `query_typed` 系だけ。名前付き prepared statement は使わない)。
 //!
-//! 文の意味は rust-alc-api の `crates/alc-notify/src/repo/notify_recipients.rs`・`notify_groups.rs` と同じ。違いは 2 つ:
+//! 文の意味は rust-alc-api の `crates/alc-notify/src/repo/notify_recipients.rs`・`notify_groups.rs`・`notify_line_config.rs`・
+//! `lineworks_channels.rs` と同じ。違いは 2 つ:
 //! - `SELECT *` を列の名前の並びにする (rust は列の名前で struct に詰める。ここは位置で読むので並びを固定する)
 //! - tenant_id の列が在る表は、RLS に加えて `WHERE tenant_id` でも絞る (RLS の下では同じ行になる)
 //!
 //! `notify_recipient_groups` は tenant_id の列を持たず、RLS (migration 099) が group の tenant で絞る。
-//! 行は transaction の中で owned な [`NotifyRecipient`] / [`NotifyGroup`] に詰め替えてから外へ返す。
+//! 行は transaction の中で owned な [`NotifyRecipient`] / [`NotifyGroup`] / [`NotifyLineConfig`] / [`LineworksChannel`] に
+//! 詰め替えてから外へ返す。
 
 use alc_worker_db::{PgClient, TxOutput};
 use chrono::{DateTime, Utc};
@@ -113,6 +115,60 @@ pub mod sql {
          JOIN notify_recipient_groups rg ON rg.recipient_id = r.id \
          WHERE rg.group_id = $1 AND r.tenant_id = $2 \
          ORDER BY r.name";
+
+    /// notify_line_configs の返してよい列 (rust の `NotifyLineConfig` の並び。暗号文の列は読まない)
+    macro_rules! line_config_cols {
+        () => {
+            "id, tenant_id, name, channel_id, bot_basic_id, public_key_jwk, enabled, created_at, updated_at"
+        };
+    }
+    /// lineworks_channels の列 (rust の `LineworksChannel` の並び)
+    macro_rules! channel_cols {
+        () => {
+            "id, tenant_id, bot_config_id, channel_id, title, channel_type, joined_at, active, created_at, updated_at"
+        };
+    }
+
+    pub const GET_LINE_CONFIG: &str = concat!(
+        "SELECT ",
+        line_config_cols!(),
+        " FROM notify_line_configs WHERE tenant_id = $1 LIMIT 1"
+    );
+
+    /// tenant に 1 行 (UNIQUE (tenant_id))。在れば全部の項目を差し替える (rust と同じ)
+    pub const UPSERT_LINE_CONFIG: &str = concat!(
+        "INSERT INTO notify_line_configs \
+         (tenant_id, name, channel_id, channel_secret_encrypted, key_id, private_key_encrypted, bot_basic_id, public_key_jwk) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8) \
+         ON CONFLICT (tenant_id) DO UPDATE SET \
+         name = EXCLUDED.name, \
+         channel_id = EXCLUDED.channel_id, \
+         channel_secret_encrypted = EXCLUDED.channel_secret_encrypted, \
+         key_id = EXCLUDED.key_id, \
+         private_key_encrypted = EXCLUDED.private_key_encrypted, \
+         bot_basic_id = EXCLUDED.bot_basic_id, \
+         public_key_jwk = EXCLUDED.public_key_jwk, \
+         updated_at = NOW() \
+         RETURNING ",
+        line_config_cols!()
+    );
+
+    pub const DELETE_LINE_CONFIG: &str = "DELETE FROM notify_line_configs WHERE tenant_id = $1";
+
+    pub const LIST_ACTIVE_CHANNELS: &str = concat!(
+        "SELECT ",
+        channel_cols!(),
+        " FROM lineworks_channels WHERE tenant_id = $1 AND active = TRUE ORDER BY joined_at DESC"
+    );
+
+    pub const GET_CHANNEL: &str = concat!(
+        "SELECT ",
+        channel_cols!(),
+        " FROM lineworks_channels WHERE tenant_id = $1 AND id = $2"
+    );
+
+    pub const DELETE_CHANNEL: &str =
+        "DELETE FROM lineworks_channels WHERE tenant_id = $1 AND id = $2";
 }
 
 /// rust の `alc_core::repository::notify_recipients::NotifyRecipient` と同じ JSON
@@ -177,6 +233,80 @@ pub struct CreateNotifyGroup {
 pub struct UpdateNotifyGroup {
     pub name: Option<String>,
     pub description: Option<String>,
+}
+
+/// rust の `alc_core::repository::notify_line_config::NotifyLineConfig` と同じ JSON (暗号文の項目を持たない)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NotifyLineConfig {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub name: String,
+    pub channel_id: String,
+    pub bot_basic_id: Option<String>,
+    pub public_key_jwk: Option<String>,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl TxOutput for NotifyLineConfig {}
+
+/// [`upsert_line_config`] に渡す値。秘密値 2 つは暗号化した後の文字列
+#[derive(Debug, Clone)]
+pub struct UpsertLineConfigRow {
+    pub name: String,
+    pub channel_id: String,
+    pub channel_secret_encrypted: String,
+    pub key_id: String,
+    pub private_key_encrypted: String,
+    pub bot_basic_id: Option<String>,
+    pub public_key_jwk: Option<String>,
+}
+
+/// rust の `alc_core::repository::lineworks_channels::LineworksChannel` と同じ JSON
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LineworksChannel {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub bot_config_id: Uuid,
+    pub channel_id: String,
+    pub title: Option<String>,
+    pub channel_type: Option<String>,
+    pub joined_at: DateTime<Utc>,
+    pub active: bool,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl TxOutput for LineworksChannel {}
+
+fn line_config(r: &Row) -> NotifyLineConfig {
+    NotifyLineConfig {
+        id: r.get(0),
+        tenant_id: r.get(1),
+        name: r.get(2),
+        channel_id: r.get(3),
+        bot_basic_id: r.get(4),
+        public_key_jwk: r.get(5),
+        enabled: r.get(6),
+        created_at: r.get(7),
+        updated_at: r.get(8),
+    }
+}
+
+fn channel(r: &Row) -> LineworksChannel {
+    LineworksChannel {
+        id: r.get(0),
+        tenant_id: r.get(1),
+        bot_config_id: r.get(2),
+        channel_id: r.get(3),
+        title: r.get(4),
+        channel_type: r.get(5),
+        joined_at: r.get(6),
+        active: r.get(7),
+        created_at: r.get(8),
+        updated_at: r.get(9),
+    }
 }
 
 fn recipient(r: &Row) -> NotifyRecipient {
@@ -490,6 +620,108 @@ pub async fn list_members(
                 )
                 .await?;
             Ok(rows.iter().map(recipient).collect())
+        })
+    })
+    .await
+}
+
+pub async fn get_line_config(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+) -> Result<Option<NotifyLineConfig>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let row = tx
+                .query_typed_opt(sql::GET_LINE_CONFIG, &[(&tenant_id, Type::UUID)])
+                .await?;
+            Ok(row.as_ref().map(line_config))
+        })
+    })
+    .await
+}
+
+pub async fn upsert_line_config(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    input: UpsertLineConfigRow,
+) -> Result<NotifyLineConfig, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let row = tx
+                .query_typed_one(
+                    sql::UPSERT_LINE_CONFIG,
+                    &[
+                        (&tenant_id, Type::UUID),
+                        (&input.name, Type::TEXT),
+                        (&input.channel_id, Type::TEXT),
+                        (&input.channel_secret_encrypted, Type::TEXT),
+                        (&input.key_id, Type::TEXT),
+                        (&input.private_key_encrypted, Type::TEXT),
+                        (&input.bot_basic_id, Type::TEXT),
+                        (&input.public_key_jwk, Type::TEXT),
+                    ],
+                )
+                .await?;
+            Ok(line_config(&row))
+        })
+    })
+    .await
+}
+
+pub async fn delete_line_config(pg: &mut PgClient, tenant_id: Uuid) -> Result<(), Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            tx.execute_typed(sql::DELETE_LINE_CONFIG, &[(&tenant_id, Type::UUID)])
+                .await?;
+            Ok(())
+        })
+    })
+    .await
+}
+
+pub async fn list_active_channels(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+) -> Result<Vec<LineworksChannel>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(sql::LIST_ACTIVE_CHANNELS, &[(&tenant_id, Type::UUID)])
+                .await?;
+            Ok(rows.iter().map(channel).collect())
+        })
+    })
+    .await
+}
+
+pub async fn get_channel(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    id: Uuid,
+) -> Result<Option<LineworksChannel>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let row = tx
+                .query_typed_opt(
+                    sql::GET_CHANNEL,
+                    &[(&tenant_id, Type::UUID), (&id, Type::UUID)],
+                )
+                .await?;
+            Ok(row.as_ref().map(channel))
+        })
+    })
+    .await
+}
+
+pub async fn delete_channel(pg: &mut PgClient, tenant_id: Uuid, id: Uuid) -> Result<(), Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            tx.execute_typed(
+                sql::DELETE_CHANNEL,
+                &[(&tenant_id, Type::UUID), (&id, Type::UUID)],
+            )
+            .await?;
+            Ok(())
         })
     })
     .await

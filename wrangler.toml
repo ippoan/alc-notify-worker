@@ -39,6 +39,18 @@ enabled = true
 binding = "NOTIFY_HYPERDRIVE"
 id = "6bdf446634034f989d4e094d5510b162"
 
+# line-config の channel_secret / private_key の暗号化の鍵 (ippoan/alc-lineworks-worker・auth-worker と同じ Secrets Store の
+# secret。値は repo に無い)。binding は env に継承されないので staging にも書く
+[[secrets_store_secrets]]
+binding = "SSO_ENCRYPTION_KEY"
+store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
+secret_name = "sso-encryption-key"
+
+# LINE WORKS の API は ippoan/alc-lineworks-worker を Service Binding で呼ぶ (src/lineworks.rs)。staging は下で別に書く
+[[services]]
+binding = "ALC_LINEWORKS"
+service = "alc-lineworks"
+
 # staging: DB は ippoan/alc-vein-worker の staging と同じもの (Workers VPC の binding NOTIFY_DB_VPC から
 # 既存の Tunnel 経由で PgBouncer へ繋ぐ。src/db.rs)。Hyperdrive は通さない。
 [env.staging]
@@ -63,6 +75,15 @@ binding = "NOTIFY_DB_VPC"
 # service_id は VPC Service の参照 (宛先の Tunnel・host:port は Service 側に閉じる)
 service_id = "01a0efa3-57ee-7631-912e-7f261d828127"
 remote = true
+
+[[env.staging.secrets_store_secrets]]
+binding = "SSO_ENCRYPTION_KEY"
+store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
+secret_name = "sso-encryption-key"
+
+[[env.staging.services]]
+binding = "ALC_LINEWORKS"
+service = "alc-lineworks-staging"
 
 # ローカル (`wrangler dev --env local`) 専用。deploy しない。
 # binding を持たない (binding は env に継承されない) ので、src/db.rs は文字列 DATABASE_URL の段で繋ぐ

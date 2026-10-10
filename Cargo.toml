@@ -16,14 +16,15 @@ crate-type = ["cdylib"]
 [workspace]
 members = ["crates/notify"]
 
-# alc-core-wasm と alc-worker-db は ippoan/alc-worker-kit から引く。git 依存・rev 固定で、**2 つとも同じ rev**
-# (ippoan/alc-lineworks-worker と同じ rev)。**書くのはここ 1 か所だけ** (worker と crates/notify は `workspace = true` で継承する)。
+# alc-core-wasm・alc-worker-db・alc-worker-crypto は ippoan/alc-worker-kit から引く。git 依存・rev 固定で、**3 つとも同じ rev**
+# (alc-worker-crypto 入りの rev)。**書くのはここ 1 か所だけ** (worker と crates/notify は `workspace = true` で継承する)。
 # 出どころが 2 つになると `PgClient` (alc-worker-db) や `TenantId` (alc-core-wasm) が別の型になり、
 # コンパイルは通るのに全リクエストが 500 になる。
-# rev を上げるときは 2 つを一緒に上げ、Cargo.lock も一緒に更新する。
+# rev を上げるときは 3 つを一緒に上げ、Cargo.lock も一緒に更新する。
 [workspace.dependencies]
-alc-core-wasm = { git = "https://github.com/ippoan/alc-worker-kit", rev = "5a3b749e891a68f026b53b4402e8861d3aeb3639" }
-alc-worker-db = { git = "https://github.com/ippoan/alc-worker-kit", rev = "5a3b749e891a68f026b53b4402e8861d3aeb3639" }
+alc-core-wasm = { git = "https://github.com/ippoan/alc-worker-kit", rev = "a256d2a84682d375dc649d3c4e0e2e91d38c17c2" }
+alc-worker-crypto = { git = "https://github.com/ippoan/alc-worker-kit", rev = "a256d2a84682d375dc649d3c4e0e2e91d38c17c2" }
+alc-worker-db = { git = "https://github.com/ippoan/alc-worker-kit", rev = "a256d2a84682d375dc649d3c4e0e2e91d38c17c2" }
 
 # 使わない依存は入れない
 [dependencies]

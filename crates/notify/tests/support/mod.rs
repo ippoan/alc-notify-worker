@@ -16,7 +16,9 @@ use alc_worker_db::PgClient;
 use axum::body::Body;
 use axum::http::Request;
 use axum::Router;
+use futures_util::future::BoxFuture;
 use futures_util::lock::Mutex;
+use notify::lineworks::{LineworksApi, LwRequest, LwResponse, LwUnreachable};
 use notify::{router, NotifyState};
 use tokio::sync::OnceCell;
 use tokio_postgres::{Client, Config, NoTls};
@@ -157,7 +159,8 @@ pub async fn rt_client() -> PgClient {
         .query_one(
             "SELECT (SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user), \
              (SELECT bool_or(tableowner = current_user) FROM pg_tables WHERE schemaname = 'alc_api' \
-              AND tablename IN ('notify_recipients', 'notify_groups', 'notify_recipient_groups'))",
+              AND tablename IN ('notify_recipients', 'notify_groups', 'notify_recipient_groups', \
+              'notify_line_configs', 'lineworks_channels'))",
             &[],
         )
         .await
@@ -204,22 +207,78 @@ pub async fn tenant() -> Uuid {
     id
 }
 
+/// lineworks-worker (Service Binding) のモック。受けたリクエストを残し、決めた応答を返す (既定は 204 本文なし)
+pub struct MockLineworks {
+    pub calls: StdMutex<Vec<LwRequest>>,
+    pub reply: StdMutex<Result<LwResponse, LwUnreachable>>,
+}
+
+impl MockLineworks {
+    /// 次からの応答を `status` と本文にする
+    pub fn reply(&self, status: u16, body: &[u8]) {
+        *self.reply.lock().unwrap() = Ok(LwResponse {
+            status,
+            body: body.to_vec(),
+        });
+    }
+
+    pub fn unreachable(&self, label: &'static str) {
+        *self.reply.lock().unwrap() = Err(LwUnreachable(label));
+    }
+
+    pub fn calls(&self) -> Vec<LwRequest> {
+        self.calls.lock().unwrap().clone()
+    }
+}
+
+impl LineworksApi for MockLineworks {
+    fn call(&self, req: LwRequest) -> BoxFuture<'_, Result<LwResponse, LwUnreachable>> {
+        self.calls.lock().unwrap().push(req);
+        let reply = self.reply.lock().unwrap().clone();
+        Box::pin(async move { reply })
+    }
+}
+
+/// テストの `SSO_ENCRYPTION_KEY` (秘密ではない)
+pub const TEST_SSO_KEY: &str = "notify-test-sso-key";
+
 pub struct App {
     pub router: Router,
     pub logs: Arc<StdMutex<Vec<String>>>,
+    pub lineworks: Arc<MockLineworks>,
 }
 
-/// worker の src/lib.rs と同じ組み立て
+impl App {
+    pub fn logs(&self) -> Vec<String> {
+        self.logs.lock().unwrap().clone()
+    }
+}
+
+/// worker の src/lib.rs と同じ組み立て (鍵は [`TEST_SSO_KEY`])
 pub fn build(pg: PgClient) -> App {
+    build_with_key(pg, Some(TEST_SSO_KEY))
+}
+
+pub fn build_with_key(pg: PgClient, sso_key: Option<&str>) -> App {
     let logs = Arc::new(StdMutex::new(Vec::new()));
     let sink = logs.clone();
+    let lineworks = Arc::new(MockLineworks {
+        calls: StdMutex::new(Vec::new()),
+        reply: StdMutex::new(Ok(LwResponse {
+            status: 204,
+            body: Vec::new(),
+        })),
+    });
     let state = NotifyState {
         pg: Arc::new(Mutex::new(pg)),
+        lineworks: lineworks.clone(),
+        sso_key: sso_key.map(Arc::from),
         log: Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_owned())),
     };
     App {
         router: router().with_state(state),
         logs,
+        lineworks,
     }
 }
 

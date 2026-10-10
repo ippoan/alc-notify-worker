@@ -2,6 +2,10 @@
 //!
 //! - [`recipients`] — 宛先の CRUD と一括登録 (`/api/notify/recipients`)
 //! - [`groups`] — 宛先のグループの CRUD とメンバー (`/api/notify/groups`)
+//! - [`line_config`] — LINE の設定 (`/api/notify/line-config`。秘密値は暗号化して保存)
+//! - [`channels`] — LINE WORKS の Bot が招かれたトークルームの一覧・削除・試し送信 (`/api/notify/lineworks/channels`)
+//! - [`lineworks`] — LINE WORKS の組織のメンバーとログイン状況 (`/api/notify/lineworks/users`・`/login-activity`)。
+//!   LINE WORKS の API は ippoan/alc-lineworks-worker を Service Binding で呼ぶ ([`lineworks::LineworksApi`])
 //! - [`pg`] — SQL (`PgClient::tenant_tx` + `query_typed` 系だけ)
 //!
 //! path・method・JSON の形・status は rust と同じ (nuxt-notify と auth-worker がそのまま使う)。path の頭の `/api` は、
@@ -9,9 +13,12 @@
 //! tenant は auth-worker が付ける `X-Tenant-ID` (無い・UUID でない → 401。`alc_core_wasm::require_tenant_header`)。
 //! role の検査は rust にも無いので持たない。
 //!
-//! 失敗の応答は rust と同じく本文なしの status だけ。ログは固定の語と DB のエラーの kind だけ (識別子・入力の値を出さない)。
+//! 失敗の応答は rust と同じ (宛先・グループ・line-config は本文なしの status、LINE WORKS の口は `{"error": ...}`)。ログは固定の語と DB のエラーの kind だけ (識別子・入力の値を出さない)。
 
+pub mod channels;
 pub mod groups;
+pub mod line_config;
+pub mod lineworks;
 pub mod pg;
 pub mod recipients;
 
@@ -22,12 +29,17 @@ use alc_worker_db::{kind, PgClient};
 use axum::http::StatusCode;
 use axum::{middleware, Router};
 use futures_util::lock::Mutex;
+use lineworks::LineworksApi;
 
 pub type LogSink = Arc<dyn Fn(&str) + Send + Sync>;
 
 #[derive(Clone)]
 pub struct NotifyState {
     pub pg: Arc<Mutex<PgClient>>,
+    /// ippoan/alc-lineworks-worker (Service Binding `ALC_LINEWORKS`)
+    pub lineworks: Arc<dyn LineworksApi>,
+    /// `SSO_ENCRYPTION_KEY` (Secrets Store)。worker は line-config の POST でだけ引く (ほかは `None`)
+    pub sso_key: Option<Arc<str>>,
     pub log: LogSink,
 }
 
@@ -44,5 +56,8 @@ pub fn router() -> Router<NotifyState> {
     Router::new()
         .merge(recipients::router())
         .merge(groups::router())
+        .merge(line_config::router())
+        .merge(channels::router())
+        .merge(lineworks::router())
         .route_layer(middleware::from_fn(require_tenant_header))
 }

@@ -5,7 +5,8 @@
 #   NOTIFY_TEST_ADMIN_DATABASE_URL=... cargo llvm-cov --locked -p notify --text > cov-notify.txt
 #   bash scripts/check_coverage_100.sh --use-cache cov-notify.txt
 #
-# 計測するのは `cargo test -p notify` の全部 = tests/recipients_db.rs (口から実 DB まで。接続先が無ければ失敗する)。
+# 計測するのは `cargo test -p notify` の全部 = tests/recipients_db.rs・tests/lineworks_db.rs (口から実 DB まで。接続先が無ければ失敗する。
+# lineworks-worker はモック)。
 # worker 本体 (直下の src/、wasm 専用) は native で計測できないので対象外。
 
 # tenant の layer と DB の失敗の応答・ログ
@@ -23,3 +24,15 @@ path = "crates/notify/src/recipients.rs"
 # グループの口 (CRUD とメンバー)
 [[files]]
 path = "crates/notify/src/groups.rs"
+
+# LINE の設定の口 (暗号化して保存)
+[[files]]
+path = "crates/notify/src/line_config.rs"
+
+# LINE WORKS のトークルームの口 (一覧・削除・試し送信。lineworks-worker はモック)
+[[files]]
+path = "crates/notify/src/channels.rs"
+
+# LINE WORKS の users・login-activity と lineworks-worker の呼び出し・断りの写し
+[[files]]
+path = "crates/notify/src/lineworks.rs"
