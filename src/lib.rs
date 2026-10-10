@@ -4,22 +4,54 @@
 //!
 //! **この Worker は呼び手を認証しない。** 本番・staging とも workers.dev を開けず (`workers_dev` / `preview_urls` = false、
 //! `routes` を持たない)、入口は auth-worker からの Service Binding だけ (wrangler.toml と scripts/check-exposure.sh が保証する)。
+//!
+//! LINE WORKS の API は ippoan/alc-lineworks-worker を Service Binding `ALC_LINEWORKS` で呼ぶ ([`lineworks`])。
+//! 秘密値 `SSO_ENCRYPTION_KEY` (Secrets Store) は line-config の POST でだけ引く。
 
 // worker 本体は wasm32 専用。native の `cargo build` / `clippy` / `test` (workspace の root で打つもの) では空の crate にして、
 // crates/notify だけを検査させる
 #![cfg(target_arch = "wasm32")]
 
 mod db;
+mod lineworks;
 mod tcp;
 
 use std::sync::Arc;
 
 use axum::body::Body;
-use axum::http::{HeaderValue, Response, StatusCode};
+use axum::http::{HeaderValue, Method, Response, StatusCode};
 use futures_util::lock::Mutex;
+use notify::line_config::LINE_CONFIG_PATH;
+use notify::lineworks::LineworksApi;
 use notify::{router, LogSink, NotifyState};
 use tower_service::Service;
 use worker::{console_error, event, Context, Env, HttpRequest, Result, WorkerVersionMetadata};
+
+use crate::lineworks::{LineworksBinding, NoLineworks};
+
+/// line-config の秘密値の暗号化の鍵 (Secrets Store。auth-worker・alc-lineworks-worker と同じ secret)
+const SSO_ENCRYPTION_KEY_BINDING: &str = "SSO_ENCRYPTION_KEY";
+/// ippoan/alc-lineworks-worker の Service Binding
+const ALC_LINEWORKS_BINDING: &str = "ALC_LINEWORKS";
+
+/// Secrets Store の値。取れなければ `None` (口が本文なしの 500 にする)
+async fn secret(env: &Env, binding: &str) -> Option<Arc<str>> {
+    let store = env.secret_store(binding).ok()?;
+    match store.get().await {
+        Ok(Some(v)) => Some(Arc::from(v)),
+        _ => {
+            console_error!("notify: no {binding} value");
+            None
+        }
+    }
+}
+
+fn lineworks_api(env: &Env) -> Arc<dyn LineworksApi> {
+    match env.service(ALC_LINEWORKS_BINDING) {
+        Ok(fetcher) => Arc::new(LineworksBinding::new(fetcher)),
+        Err(_) => Arc::new(NoLineworks),
+    }
+}
 
 fn log_sink() -> LogSink {
     Arc::new(|message| console_error!("{message}"))
@@ -51,8 +83,16 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
             ));
         }
     };
+    // 鍵を引くのは line-config の POST だけ (ほかの口では Secrets Store を読まない)
+    let sso_key = if req.method() == Method::POST && req.uri().path() == LINE_CONFIG_PATH {
+        secret(&env, SSO_ENCRYPTION_KEY_BINDING).await
+    } else {
+        None
+    };
     let state = NotifyState {
         pg: Arc::new(Mutex::new(pg)),
+        lineworks: lineworks_api(&env),
+        sso_key,
         log: log_sink(),
     };
     let mut resp = match router().with_state(state).call(req).await {
