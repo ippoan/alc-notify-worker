@@ -6,33 +6,54 @@
 //! `routes` を持たない)、入口は auth-worker からの Service Binding だけ (wrangler.toml と scripts/check-exposure.sh が保証する)。
 //!
 //! LINE WORKS の API は ippoan/alc-lineworks-worker を Service Binding `ALC_LINEWORKS` で呼ぶ ([`lineworks`])。
-//! 秘密値 `SSO_ENCRYPTION_KEY` (Secrets Store) は line-config の POST でだけ引く。
+//! 秘密値 `SSO_ENCRYPTION_KEY` (Secrets Store) は line-config の POST と配信の口でだけ、`INTERNAL_SHARED_SECRET`
+//! (Secrets Store、viewer の register-view の認証) は配信の口でだけ引く。配信の外への POST (LINE・viewer) は [`http`]。
 
 // worker 本体は wasm32 専用。native の `cargo build` / `clippy` / `test` (workspace の root で打つもの) では空の crate にして、
 // crates/notify だけを検査させる
 #![cfg(target_arch = "wasm32")]
 
 mod db;
+mod http;
 mod lineworks;
 mod tcp;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use axum::body::Body;
 use axum::http::{HeaderValue, Method, Response, StatusCode};
 use futures_util::lock::Mutex;
+use notify::distribute::{is_distribute_request, Outbound};
+use notify::line::{LineEndpoints, LineTokenCache};
 use notify::line_config::LINE_CONFIG_PATH;
 use notify::lineworks::LineworksApi;
 use notify::{router, LogSink, NotifyState};
 use tower_service::Service;
-use worker::{console_error, event, Context, Env, HttpRequest, Result, WorkerVersionMetadata};
+use worker::{
+    console_error, event, Context, Date, Env, HttpRequest, Result, WorkerVersionMetadata,
+};
 
+use crate::http::WorkerHttp;
 use crate::lineworks::{LineworksBinding, NoLineworks};
 
 /// line-config の秘密値の暗号化の鍵 (Secrets Store。auth-worker・alc-lineworks-worker と同じ secret)
 const SSO_ENCRYPTION_KEY_BINDING: &str = "SSO_ENCRYPTION_KEY";
 /// ippoan/alc-lineworks-worker の Service Binding
 const ALC_LINEWORKS_BINDING: &str = "ALC_LINEWORKS";
+/// viewer の register-view の認証 (Secrets Store。nuxt-notify・auth-worker などと同じ secret)
+const INTERNAL_SHARED_SECRET_BINDING: &str = "INTERNAL_SHARED_SECRET";
+/// viewer の Worker (ippoan/nuxt-notify) の公開 URL (wrangler.toml の vars)
+const NOTIFY_FRONTEND_URL_VAR: &str = "NOTIFY_FRONTEND_URL";
+
+/// LINE の channel access token の置き場 (isolate の間ずっと持つ。キーは channel ごと)
+fn line_tokens() -> Arc<LineTokenCache> {
+    static CACHE: OnceLock<Arc<LineTokenCache>> = OnceLock::new();
+    CACHE.get_or_init(Default::default).clone()
+}
+
+fn now_secs() -> u64 {
+    Date::now().as_millis() / 1000
+}
 
 /// Secrets Store の値。取れなければ `None` (口が本文なしの 500 にする)
 async fn secret(env: &Env, binding: &str) -> Option<Arc<str>> {
@@ -83,16 +104,35 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
             ));
         }
     };
-    // 鍵を引くのは line-config の POST だけ (ほかの口では Secrets Store を読まない)
-    let sso_key = if req.method() == Method::POST && req.uri().path() == LINE_CONFIG_PATH {
+    // 秘密値を引くのは line-config の POST と配信の口だけ (ほかの口では Secrets Store を読まない)
+    let post = req.method() == Method::POST;
+    let distributing = is_distribute_request(post, req.uri().path());
+    let sso_key = if distributing || (post && req.uri().path() == LINE_CONFIG_PATH) {
         secret(&env, SSO_ENCRYPTION_KEY_BINDING).await
     } else {
         None
+    };
+    let viewer_secret = if distributing {
+        secret(&env, INTERNAL_SHARED_SECRET_BINDING).await
+    } else {
+        None
+    };
+    let outbound = Outbound {
+        http: Arc::new(WorkerHttp),
+        line_endpoints: LineEndpoints::default(),
+        line_tokens: line_tokens(),
+        frontend_url: env
+            .var(NOTIFY_FRONTEND_URL_VAR)
+            .ok()
+            .map(|v| Arc::from(v.to_string())),
+        viewer_secret,
+        now: Arc::new(now_secs),
     };
     let state = NotifyState {
         pg: Arc::new(Mutex::new(pg)),
         lineworks: lineworks_api(&env),
         sso_key,
+        outbound,
         log: log_sink(),
     };
     let mut resp = match router().with_state(state).call(req).await {

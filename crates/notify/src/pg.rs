@@ -1,12 +1,13 @@
 //! SQL を流す 1 か所 (`PgClient::tenant_tx` + `query_typed` 系だけ。名前付き prepared statement は使わない)。
 //!
 //! 文の意味は rust-alc-api の `crates/alc-notify/src/repo/notify_recipients.rs`・`notify_groups.rs`・`notify_line_config.rs`・
-//! `lineworks_channels.rs` と同じ。違いは 2 つ:
+//! `lineworks_channels.rs`・`notify_documents.rs`・`notify_deliveries.rs` と同じ。違いは 2 つ:
 //! - `SELECT *` を列の名前の並びにする (rust は列の名前で struct に詰める。ここは位置で読むので並びを固定する)
 //! - tenant_id の列が在る表は、RLS に加えて `WHERE tenant_id` でも絞る (RLS の下では同じ行になる)
 //!
 //! `notify_recipient_groups` は tenant_id の列を持たず、RLS (migration 099) が group の tenant で絞る。
-//! 行は transaction の中で owned な [`NotifyRecipient`] / [`NotifyGroup`] / [`NotifyLineConfig`] / [`LineworksChannel`] に
+//! 行は transaction の中で owned な [`NotifyRecipient`] / [`NotifyGroup`] / [`NotifyLineConfig`] / [`LineworksChannel`] /
+//! [`NotifyDocument`] / [`DeliveryRow`] / [`LineSecrets`] に
 //! 詰め替えてから外へ返す。
 
 use alc_worker_db::{PgClient, TxOutput};
@@ -169,6 +170,58 @@ pub mod sql {
 
     pub const DELETE_CHANNEL: &str =
         "DELETE FROM lineworks_channels WHERE tenant_id = $1 AND id = $2";
+
+    // ---- 配信 (rust の `repo/notify_documents.rs`・`notify_deliveries.rs`・`notify_recipients.rs` の list_enabled・
+    //      `notify_groups.rs` の list_enabled_members・`notify_line_config.rs` の get_full) ----
+
+    /// 配信に使う notify_documents の列 ([`super::NotifyDocument`] の並び)。extracted_data は text で読んで JSON にする
+    pub const GET_DOCUMENT: &str = "SELECT id, r2_key, file_name, file_size_bytes, source_subject, source_sender, \
+         extracted_title, extracted_summary, extracted_data::text, redaction_status, redacted_r2_key, created_at \
+         FROM notify_documents WHERE tenant_id = $1 AND id = $2";
+
+    pub const LIST_ENABLED_RECIPIENTS: &str = concat!(
+        "SELECT ",
+        recipient_cols!(),
+        " FROM notify_recipients WHERE tenant_id = $1 AND enabled = TRUE ORDER BY name"
+    );
+
+    pub const LIST_ENABLED_MEMBERS: &str =
+        "SELECT r.id, r.tenant_id, r.name, r.provider, r.lineworks_user_id, r.line_user_id, \
+         r.phone_number, r.email, r.enabled, r.created_at, r.updated_at \
+         FROM notify_recipients r \
+         JOIN notify_recipient_groups rg ON rg.recipient_id = r.id \
+         WHERE rg.group_id = $1 AND r.tenant_id = $2 AND r.enabled = TRUE \
+         ORDER BY r.name";
+
+    /// LINE の送信に要る列 (暗号文のまま。復号は呼び手)
+    pub const GET_LINE_SECRETS: &str = "SELECT channel_id, key_id, private_key_encrypted \
+         FROM notify_line_configs WHERE tenant_id = $1 LIMIT 1";
+
+    /// `completed` のときだけ distributed_at を今にする (rust の `COALESCE($2, distributed_at)` と同じ)
+    pub const UPDATE_DISTRIBUTION_STATUS: &str = "UPDATE notify_documents SET \
+         distribution_status = $1, \
+         distributed_at = CASE WHEN $1 = 'completed' THEN NOW() ELSE distributed_at END, \
+         updated_at = NOW() \
+         WHERE tenant_id = $2 AND id = $3";
+
+    pub const CREATE_DELIVERY: &str =
+        "INSERT INTO notify_deliveries (tenant_id, document_id, recipient_id, provider) \
+         VALUES ($1, $2, $3, $4) RETURNING id, recipient_id, read_token";
+
+    pub const SET_TRIGGERED_BY: &str = "UPDATE notify_deliveries SET triggered_by_user_id = $1 \
+         WHERE tenant_id = $2 AND id = ANY($3)";
+
+    /// 既定 (migration 106 の `NOW() + 7 days`) 以外の閲覧期限
+    pub const SET_EXPIRE_AT: &str =
+        "UPDATE notify_deliveries SET expire_at = NOW() + make_interval(days => $1) \
+         WHERE tenant_id = $2 AND id = ANY($3)";
+
+    pub const MARK_SENT: &str = "UPDATE notify_deliveries SET status = 'sent', sent_at = NOW(), \
+         attempt = attempt + 1 WHERE tenant_id = $1 AND id = $2";
+
+    /// `error_message` は固定の語だけ (上流の本文・宛先を入れない)
+    pub const MARK_FAILED: &str = "UPDATE notify_deliveries SET status = 'failed', \
+         error_message = $1, attempt = attempt + 1 WHERE tenant_id = $2 AND id = $3";
 }
 
 /// rust の `alc_core::repository::notify_recipients::NotifyRecipient` と同じ JSON
@@ -279,6 +332,64 @@ pub struct LineworksChannel {
 }
 
 impl TxOutput for LineworksChannel {}
+
+/// 配信に使う notify_documents の列 (rust の `NotifyDocument` のうち distribute が読むもの)
+#[derive(Debug, Clone, PartialEq)]
+pub struct NotifyDocument {
+    pub id: Uuid,
+    pub r2_key: String,
+    pub file_name: Option<String>,
+    pub file_size_bytes: Option<i64>,
+    pub source_subject: Option<String>,
+    pub source_sender: Option<String>,
+    pub extracted_title: Option<String>,
+    pub extracted_summary: Option<String>,
+    pub extracted_data: Option<serde_json::Value>,
+    pub redaction_status: String,
+    pub redacted_r2_key: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl TxOutput for NotifyDocument {}
+
+/// notify_deliveries に作った 1 行
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeliveryRow {
+    pub id: Uuid,
+    pub recipient_id: Uuid,
+    pub read_token: Uuid,
+}
+
+impl TxOutput for DeliveryRow {}
+
+/// LINE の送信に要る設定 (暗号文のまま)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LineSecrets {
+    pub channel_id: String,
+    pub key_id: Option<String>,
+    pub private_key_encrypted: Option<String>,
+}
+
+impl TxOutput for LineSecrets {}
+
+fn document(r: &Row) -> NotifyDocument {
+    NotifyDocument {
+        id: r.get(0),
+        r2_key: r.get(1),
+        file_name: r.get(2),
+        file_size_bytes: r.get(3),
+        source_subject: r.get(4),
+        source_sender: r.get(5),
+        extracted_title: r.get(6),
+        extracted_summary: r.get(7),
+        extracted_data: r
+            .get::<_, Option<String>>(8)
+            .and_then(|s| serde_json::from_str(&s).ok()),
+        redaction_status: r.get(9),
+        redacted_r2_key: r.get(10),
+        created_at: r.get(11),
+    }
+}
 
 fn line_config(r: &Row) -> NotifyLineConfig {
     NotifyLineConfig {
@@ -719,6 +830,215 @@ pub async fn delete_channel(pg: &mut PgClient, tenant_id: Uuid, id: Uuid) -> Res
             tx.execute_typed(
                 sql::DELETE_CHANNEL,
                 &[(&tenant_id, Type::UUID), (&id, Type::UUID)],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+}
+
+pub async fn get_document(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    id: Uuid,
+) -> Result<Option<NotifyDocument>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let row = tx
+                .query_typed_opt(
+                    sql::GET_DOCUMENT,
+                    &[(&tenant_id, Type::UUID), (&id, Type::UUID)],
+                )
+                .await?;
+            Ok(row.as_ref().map(document))
+        })
+    })
+    .await
+}
+
+pub async fn list_enabled_recipients(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+) -> Result<Vec<NotifyRecipient>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(sql::LIST_ENABLED_RECIPIENTS, &[(&tenant_id, Type::UUID)])
+                .await?;
+            Ok(rows.iter().map(recipient).collect())
+        })
+    })
+    .await
+}
+
+pub async fn list_enabled_members(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    group_id: Uuid,
+) -> Result<Vec<NotifyRecipient>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(
+                    sql::LIST_ENABLED_MEMBERS,
+                    &[(&group_id, Type::UUID), (&tenant_id, Type::UUID)],
+                )
+                .await?;
+            Ok(rows.iter().map(recipient).collect())
+        })
+    })
+    .await
+}
+
+pub async fn get_line_secrets(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+) -> Result<Option<LineSecrets>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let row = tx
+                .query_typed_opt(sql::GET_LINE_SECRETS, &[(&tenant_id, Type::UUID)])
+                .await?;
+            Ok(row.map(|r| LineSecrets {
+                channel_id: r.get(0),
+                key_id: r.get(1),
+                private_key_encrypted: r.get(2),
+            }))
+        })
+    })
+    .await
+}
+
+pub async fn update_distribution_status(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    id: Uuid,
+    status: &'static str,
+) -> Result<(), Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            tx.execute_typed(
+                sql::UPDATE_DISTRIBUTION_STATUS,
+                &[
+                    (&status, Type::TEXT),
+                    (&tenant_id, Type::UUID),
+                    (&id, Type::UUID),
+                ],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// 宛先ごとに 1 行 (渡した順に返す。rust の `create_batch` と同じく 1 つの transaction)
+pub async fn create_deliveries(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    document_id: Uuid,
+    recipients: Vec<(Uuid, String)>,
+) -> Result<Vec<DeliveryRow>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let mut out = Vec::with_capacity(recipients.len());
+            for (recipient_id, provider) in &recipients {
+                let row = tx
+                    .query_typed_one(
+                        sql::CREATE_DELIVERY,
+                        &[
+                            (&tenant_id, Type::UUID),
+                            (&document_id, Type::UUID),
+                            (recipient_id, Type::UUID),
+                            (provider, Type::TEXT),
+                        ],
+                    )
+                    .await?;
+                out.push(DeliveryRow {
+                    id: row.get(0),
+                    recipient_id: row.get(1),
+                    read_token: row.get(2),
+                });
+            }
+            Ok(out)
+        })
+    })
+    .await
+}
+
+/// 作った行に、配信した人 (`triggered_by`) と既定以外の閲覧期限 (`expire_days`) を書く (1 つの transaction。
+/// rust は同じ 2 本の UPDATE を別々に流していた)。どちらも無ければ DB に触らない
+pub async fn adjust_deliveries(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    ids: Vec<Uuid>,
+    triggered_by: Option<Uuid>,
+    expire_days: Option<i32>,
+) -> Result<(), Error> {
+    if triggered_by.is_none() && expire_days.is_none() {
+        return Ok(());
+    }
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            if let Some(user_id) = triggered_by {
+                tx.execute_typed(
+                    sql::SET_TRIGGERED_BY,
+                    &[
+                        (&user_id, Type::UUID),
+                        (&tenant_id, Type::UUID),
+                        (&ids, Type::UUID_ARRAY),
+                    ],
+                )
+                .await?;
+            }
+            if let Some(days) = expire_days {
+                tx.execute_typed(
+                    sql::SET_EXPIRE_AT,
+                    &[
+                        (&days, Type::INT4),
+                        (&tenant_id, Type::UUID),
+                        (&ids, Type::UUID_ARRAY),
+                    ],
+                )
+                .await?;
+            }
+            Ok(())
+        })
+    })
+    .await
+}
+
+pub async fn mark_sent(pg: &mut PgClient, tenant_id: Uuid, id: Uuid) -> Result<(), Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            tx.execute_typed(
+                sql::MARK_SENT,
+                &[(&tenant_id, Type::UUID), (&id, Type::UUID)],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// `reason` は固定の語 (上流の本文・宛先を入れない)
+pub async fn mark_failed(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    id: Uuid,
+    reason: &'static str,
+) -> Result<(), Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            tx.execute_typed(
+                sql::MARK_FAILED,
+                &[
+                    (&reason, Type::TEXT),
+                    (&tenant_id, Type::UUID),
+                    (&id, Type::UUID),
+                ],
             )
             .await?;
             Ok(())

@@ -23,6 +23,10 @@ uuid = { version = "1", features = ["serde"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
+# LINE の JWT の検証 (テストの鍵を作り、署名を公開鍵で確かめる)。版は alc-worker-crypto が引くものと同じ
+base64 = "0.22"
+rsa = { version = "0.9", features = ["getrandom", "sha2"] }
+sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "sync"] }
 # tests/ の実 DB の接続 (runtime 付き)。dev-dependency なので wasm のビルドには入らない
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1"] }

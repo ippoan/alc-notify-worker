@@ -10,6 +10,7 @@
 
 #![allow(dead_code)]
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use alc_worker_db::PgClient;
@@ -18,6 +19,9 @@ use axum::http::Request;
 use axum::Router;
 use futures_util::future::BoxFuture;
 use futures_util::lock::Mutex;
+use notify::distribute::Outbound;
+use notify::http::{Http, HttpError, HttpRequest, HttpResponse};
+use notify::line::{LineEndpoints, LineTokenCache};
 use notify::lineworks::{LineworksApi, LwRequest, LwResponse, LwUnreachable};
 use notify::{router, NotifyState};
 use tokio::sync::OnceCell;
@@ -160,7 +164,7 @@ pub async fn rt_client() -> PgClient {
             "SELECT (SELECT rolsuper OR rolbypassrls FROM pg_roles WHERE rolname = current_user), \
              (SELECT bool_or(tableowner = current_user) FROM pg_tables WHERE schemaname = 'alc_api' \
               AND tablename IN ('notify_recipients', 'notify_groups', 'notify_recipient_groups', \
-              'notify_line_configs', 'lineworks_channels'))",
+              'notify_line_configs', 'lineworks_channels', 'notify_documents', 'notify_deliveries'))",
             &[],
         )
         .await
@@ -170,18 +174,20 @@ pub async fn rt_client() -> PgClient {
     PgClient::new(client)
 }
 
-/// 接続が切れた `alc_api_rt` の接続 (backend を落とした接続)
-pub async fn broken_client() -> PgClient {
-    let mut pg = rt_client().await;
-    let pid: i32 = pg
-        .tenant_tx(Uuid::nil(), |tx| {
-            Box::pin(async move {
-                let row = tx.query_typed_one("SELECT pg_backend_pid()", &[]).await?;
-                Ok(row.get::<_, i32>(0))
-            })
+/// 接続の backend の pid
+pub async fn backend_pid(pg: &mut PgClient) -> i32 {
+    pg.tenant_tx(Uuid::nil(), |tx| {
+        Box::pin(async move {
+            let row = tx.query_typed_one("SELECT pg_backend_pid()", &[]).await?;
+            Ok(row.get::<_, i32>(0))
         })
-        .await
-        .unwrap();
+    })
+    .await
+    .unwrap()
+}
+
+/// backend を落とす (以後その接続の DB の操作は失敗する)
+pub async fn terminate(pid: i32) {
     let terminated: bool = admin()
         .await
         .query_one("SELECT pg_terminate_backend($1)", &[&pid])
@@ -189,6 +195,13 @@ pub async fn broken_client() -> PgClient {
         .unwrap()
         .get(0);
     assert!(terminated);
+}
+
+/// 接続が切れた `alc_api_rt` の接続 (backend を落とした接続)
+pub async fn broken_client() -> PgClient {
+    let mut pg = rt_client().await;
+    let pid = backend_pid(&mut pg).await;
+    terminate(pid).await;
     pg
 }
 
@@ -207,13 +220,23 @@ pub async fn tenant() -> Uuid {
     id
 }
 
-/// lineworks-worker (Service Binding) のモック。受けたリクエストを残し、決めた応答を返す (既定は 204 本文なし)
+/// lineworks-worker (Service Binding) のモック。受けたリクエストを残し、決めた応答を返す (既定は 204 本文なし)。
+/// [`MockLineworks::then_reply`] で積んだ応答があれば、それを先に 1 つずつ返す
 pub struct MockLineworks {
     pub calls: StdMutex<Vec<LwRequest>>,
     pub reply: StdMutex<Result<LwResponse, LwUnreachable>>,
+    pub queued: StdMutex<VecDeque<Result<LwResponse, LwUnreachable>>>,
 }
 
 impl MockLineworks {
+    /// 次の 1 回だけの応答を積む (積んだ順に返す)
+    pub fn then_reply(&self, status: u16) {
+        self.queued.lock().unwrap().push_back(Ok(LwResponse {
+            status,
+            body: Vec::new(),
+        }));
+    }
+
     /// 次からの応答を `status` と本文にする
     pub fn reply(&self, status: u16, body: &[u8]) {
         *self.reply.lock().unwrap() = Ok(LwResponse {
@@ -234,18 +257,139 @@ impl MockLineworks {
 impl LineworksApi for MockLineworks {
     fn call(&self, req: LwRequest) -> BoxFuture<'_, Result<LwResponse, LwUnreachable>> {
         self.calls.lock().unwrap().push(req);
-        let reply = self.reply.lock().unwrap().clone();
+        let queued = self.queued.lock().unwrap().pop_front();
+        let reply = queued.unwrap_or_else(|| self.reply.lock().unwrap().clone());
         Box::pin(async move { reply })
+    }
+}
+
+/// [`MockHttp`] の規則 (URL の頭, 本文に含む文字列, 応答)
+type HttpRule = (String, Option<String>, Result<HttpResponse, HttpError>);
+
+/// 外への POST (LINE・viewer の register-view) のモック。受けたリクエストを残し、URL に合う規則の応答を返す
+/// (後から足した規則を先に見る。合わなければ 200 `{}`)
+#[derive(Default)]
+pub struct MockHttp {
+    pub calls: StdMutex<Vec<HttpRequest>>,
+    rules: StdMutex<Vec<HttpRule>>,
+    /// 次の POST の間に落とす DB の backend (配信の途中で DB が切れたとき)
+    kill: StdMutex<Option<i32>>,
+}
+
+impl MockHttp {
+    /// URL が `url` で始まる POST に `status` と本文を返す
+    pub fn on(&self, url: &str, status: u16, body: &str) {
+        self.rules.lock().unwrap().push((
+            url.to_owned(),
+            None,
+            Ok(HttpResponse {
+                status,
+                body: body.as_bytes().to_vec(),
+            }),
+        ));
+    }
+
+    /// URL が `url` で始まり、本文が `needle` を含む POST に `status` を返す
+    pub fn on_body(&self, url: &str, needle: &str, status: u16) {
+        self.rules.lock().unwrap().push((
+            url.to_owned(),
+            Some(needle.to_owned()),
+            Ok(HttpResponse {
+                status,
+                body: Vec::new(),
+            }),
+        ));
+    }
+
+    /// URL が `url` で始まる POST を届かなかったことにする
+    pub fn fail(&self, url: &str) {
+        self.rules
+            .lock()
+            .unwrap()
+            .push((url.to_owned(), None, Err(HttpError)));
+    }
+
+    /// 次の POST の間に DB の backend `pid` を落とす
+    pub fn kill_db_on_next_post(&self, pid: i32) {
+        *self.kill.lock().unwrap() = Some(pid);
+    }
+
+    pub fn calls(&self) -> Vec<HttpRequest> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    /// URL が `url` で始まる呼び出し
+    pub fn calls_to(&self, url: &str) -> Vec<HttpRequest> {
+        self.calls()
+            .into_iter()
+            .filter(|c| c.url.starts_with(url))
+            .collect()
+    }
+}
+
+impl Http for MockHttp {
+    fn post(&self, req: HttpRequest) -> BoxFuture<'_, Result<HttpResponse, HttpError>> {
+        let reply = self
+            .rules
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(url, needle, _)| {
+                req.url.starts_with(url.as_str())
+                    && needle
+                        .as_ref()
+                        .is_none_or(|n| String::from_utf8_lossy(&req.body).contains(n.as_str()))
+            })
+            .map(|(_, _, r)| r.clone())
+            .unwrap_or(Ok(HttpResponse {
+                status: 200,
+                body: b"{}".to_vec(),
+            }));
+        self.calls.lock().unwrap().push(req);
+        let kill = self.kill.lock().unwrap().take();
+        Box::pin(async move {
+            if let Some(pid) = kill {
+                terminate(pid).await;
+            }
+            reply
+        })
     }
 }
 
 /// テストの `SSO_ENCRYPTION_KEY` (秘密ではない)
 pub const TEST_SSO_KEY: &str = "notify-test-sso-key";
+/// テストの LINE の口・viewer・`INTERNAL_SHARED_SECRET`・今の時刻 (どれも外へ出ない名目の値)
+pub const LINE_TOKEN_URL: &str = "https://line.test/oauth2/v2.1/token";
+pub const LINE_PUSH_URL: &str = "https://line.test/v2/bot/message/push";
+pub const FRONTEND_URL: &str = "https://viewer.test";
+pub const REGISTER_URL: &str = "https://viewer.test/api/notify/register-view";
+pub const VIEWER_SECRET: &str = "viewer-test-secret";
+pub const NOW: u64 = 1_700_000_000;
+
+/// [`build_with`] の差し替え
+pub struct Options {
+    pub sso_key: Option<&'static str>,
+    pub frontend_url: Option<&'static str>,
+    pub viewer_secret: Option<&'static str>,
+}
+
+impl Default for Options {
+    fn default() -> Self {
+        Self {
+            sso_key: Some(TEST_SSO_KEY),
+            frontend_url: Some(FRONTEND_URL),
+            viewer_secret: Some(VIEWER_SECRET),
+        }
+    }
+}
 
 pub struct App {
     pub router: Router,
     pub logs: Arc<StdMutex<Vec<String>>>,
     pub lineworks: Arc<MockLineworks>,
+    pub http: Arc<MockHttp>,
+    pub line_tokens: Arc<LineTokenCache>,
 }
 
 impl App {
@@ -259,7 +403,17 @@ pub fn build(pg: PgClient) -> App {
     build_with_key(pg, Some(TEST_SSO_KEY))
 }
 
-pub fn build_with_key(pg: PgClient, sso_key: Option<&str>) -> App {
+pub fn build_with_key(pg: PgClient, sso_key: Option<&'static str>) -> App {
+    build_with(
+        pg,
+        Options {
+            sso_key,
+            ..Options::default()
+        },
+    )
+}
+
+pub fn build_with(pg: PgClient, opts: Options) -> App {
     let logs = Arc::new(StdMutex::new(Vec::new()));
     let sink = logs.clone();
     let lineworks = Arc::new(MockLineworks {
@@ -268,17 +422,33 @@ pub fn build_with_key(pg: PgClient, sso_key: Option<&str>) -> App {
             status: 204,
             body: Vec::new(),
         })),
+        queued: StdMutex::new(VecDeque::new()),
     });
+    let http = Arc::new(MockHttp::default());
+    let line_tokens = Arc::new(LineTokenCache::default());
     let state = NotifyState {
         pg: Arc::new(Mutex::new(pg)),
         lineworks: lineworks.clone(),
-        sso_key: sso_key.map(Arc::from),
+        sso_key: opts.sso_key.map(Arc::from),
+        outbound: Outbound {
+            http: http.clone(),
+            line_endpoints: LineEndpoints {
+                token: LINE_TOKEN_URL.to_owned(),
+                push: LINE_PUSH_URL.to_owned(),
+            },
+            line_tokens: line_tokens.clone(),
+            frontend_url: opts.frontend_url.map(Arc::from),
+            viewer_secret: opts.viewer_secret.map(Arc::from),
+            now: Arc::new(|| NOW),
+        },
         log: Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_owned())),
     };
     App {
         router: router().with_state(state),
         logs,
         lineworks,
+        http,
+        line_tokens,
     }
 }
 
@@ -310,9 +480,34 @@ pub async fn call(
     tenant: Option<Uuid>,
     body: Option<serde_json::Value>,
 ) -> Got {
+    let headers: Vec<(&str, String)> = tenant
+        .map(|t| ("X-Tenant-ID", t.to_string()))
+        .into_iter()
+        .collect();
+    call_with(app, method, uri, &headers, body).await
+}
+
+/// auth-worker が付ける identity のヘッダー (`X-Tenant-ID`・`X-User-ID`・`X-User-Email`・`X-User-Role`)
+pub fn identity(tenant: Uuid, user: Uuid) -> Vec<(&'static str, String)> {
+    vec![
+        ("X-Tenant-ID", tenant.to_string()),
+        ("X-User-ID", user.to_string()),
+        ("X-User-Email", "user@example.com".to_owned()),
+        ("X-User-Role", "admin".to_owned()),
+    ]
+}
+
+/// ヘッダーを渡して 1 リクエストを打つ
+pub async fn call_with(
+    app: &App,
+    method: &str,
+    uri: &str,
+    headers: &[(&str, String)],
+    body: Option<serde_json::Value>,
+) -> Got {
     let mut b = Request::builder().method(method).uri(uri);
-    if let Some(t) = tenant {
-        b = b.header("X-Tenant-ID", t.to_string());
+    for (k, v) in headers {
+        b = b.header(*k, v);
     }
     let body = match body {
         Some(v) => {
