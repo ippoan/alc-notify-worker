@@ -5,8 +5,8 @@
 #   NOTIFY_TEST_ADMIN_DATABASE_URL=... cargo llvm-cov --locked -p notify --text > cov-notify.txt
 #   bash scripts/check_coverage_100.sh --use-cache cov-notify.txt
 #
-# 計測するのは `cargo test -p notify` の全部 = tests/recipients_db.rs・tests/lineworks_db.rs (口から実 DB まで。接続先が無ければ失敗する。
-# lineworks-worker はモック)。
+# 計測するのは `cargo test -p notify` の全部 = 単体テストと tests/recipients_db.rs・tests/lineworks_db.rs・tests/distribute_db.rs (口から実 DB まで。接続先が無ければ失敗する。
+# lineworks-worker・LINE・viewer はモック)。
 # worker 本体 (直下の src/、wasm 専用) は native で計測できないので対象外。
 
 # tenant の layer と DB の失敗の応答・ログ
@@ -36,3 +36,19 @@ path = "crates/notify/src/channels.rs"
 # LINE WORKS の users・login-activity と lineworks-worker の呼び出し・断りの写し
 [[files]]
 path = "crates/notify/src/lineworks.rs"
+
+# 配信の口 (distribute・test-distribute。LINE・lineworks-worker・viewer はモック)
+[[files]]
+path = "crates/notify/src/distribute.rs"
+
+# LINE の Messaging API (JWT・token の cache・push。外への POST はモック)
+[[files]]
+path = "crates/notify/src/line.rs"
+
+# viewer の KV への登録 (register-view)
+[[files]]
+path = "crates/notify/src/viewer_register.rs"
+
+# 外への POST の口 (trait と応答)
+[[files]]
+path = "crates/notify/src/http.rs"
