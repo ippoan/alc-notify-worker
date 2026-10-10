@@ -28,7 +28,7 @@ fn line_config_body(name: &str) -> Value {
         "channel_id": "ch-1",
         "channel_secret": "secret-平文",
         "key_id": "kid-1",
-        "private_key": "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n",
+        "private_key": "dummy-private-key\nline-2\n",
         "bot_basic_id": "@bot",
     })
 }
@@ -117,7 +117,7 @@ async fn line_config_crud() {
     assert_eq!(decrypt_secret(&cs, TEST_SSO_KEY).unwrap(), "secret-平文");
     assert_eq!(
         decrypt_secret(&pk, TEST_SSO_KEY).unwrap(),
-        "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n"
+        "dummy-private-key\nline-2\n"
     );
     assert_eq!(kid, "kid-1");
 
