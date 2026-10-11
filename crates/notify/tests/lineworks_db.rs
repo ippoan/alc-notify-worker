@@ -40,7 +40,7 @@ async fn bot_config(t: Uuid) -> Uuid {
         .await
         .execute(
             "INSERT INTO alc_api.bot_configs (id, tenant_id, name, client_id, client_secret_encrypted, \
-             service_account, private_key_encrypted, bot_id) VALUES ($1, $2, 'bot', 'c', 'x', 's', 'x', $3)",
+             service_account, bot_id) VALUES ($1, $2, 'bot', 'c', 'x', 's', $3)",
             &[&id, &t, &format!("bot-{id}")],
         )
         .await
