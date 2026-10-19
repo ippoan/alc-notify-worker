@@ -75,7 +75,7 @@ jobs:
           cargo llvm-cov --locked -p notify --no-report 2>&1 | tee "$RUNNER_TEMP/notify-test.txt"
           # target ごとの結果の行だけを見る (ほかの target の行と取り違えない)
           awk '/Running tests\/recipients_db\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/notify-test.txt" \
-            | grep -Eq '^test result: ok\. 8 passed; 0 failed; 0 ignored'
+            | grep -Eq '^test result: ok\. 16 passed; 0 failed; 0 ignored'
           awk '/Running tests\/lineworks_db\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/notify-test.txt" \
             | grep -Eq '^test result: ok\. 7 passed; 0 failed; 0 ignored'
           awk '/Running tests\/distribute_db\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/notify-test.txt" \

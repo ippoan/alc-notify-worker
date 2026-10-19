@@ -8,17 +8,20 @@
 //!   LINE WORKS の API は ippoan/alc-lineworks-worker を Service Binding で呼ぶ ([`lineworks::LineworksApi`])
 //! - [`distribute`] — 文書の配信と試し配信 (`/api/notify/documents/{id}/distribute`・`/api/notify/test-distribute`)。
 //!   LINE は [`line`] (外への POST は [`http::Http`])、LINE WORKS は lineworks-worker、viewer の KV への登録は [`viewer_register`]
+//! - [`email_routing`] — 宛先のメールアドレスを Cloudflare Email Routing の送り先に登録し、確認の状態を返す (`GET /api/notify/recipients/email-status`。
+//!   Cloudflare の API は [`email_routing::EmailRoutingApi`])
 //! - [`pg`] — SQL (`PgClient::tenant_tx` + `query_typed` 系だけ)
 //!
 //! path・method・JSON の形・status は rust と同じ (nuxt-notify と auth-worker がそのまま使う)。path の頭の `/api` は、
 //! auth-worker の Service Binding が渡す path (`/api/...` のまま) に合わせる。
 //! tenant は auth-worker が付ける `X-Tenant-ID` (無い・UUID でない → 401。`alc_core_wasm::require_tenant_header`)。
-//! role の検査は rust にも無いので持たない。
+//! role の検査は rust にも無いので持たない (例外: 宛先の保存で Cloudflare の送り先を作るのは `admin` のときだけ。[`email_routing`])。
 //!
 //! 失敗の応答は rust と同じ (宛先・グループ・line-config は本文なしの status、LINE WORKS の口は `{"error": ...}`)。ログは固定の語と DB のエラーの kind だけ (識別子・入力の値を出さない)。
 
 pub mod channels;
 pub mod distribute;
+pub mod email_routing;
 pub mod groups;
 pub mod http;
 pub mod line;
@@ -35,6 +38,7 @@ use alc_worker_db::{kind, PgClient};
 use axum::http::StatusCode;
 use axum::{middleware, Router};
 use distribute::Outbound;
+use email_routing::EmailRoutingApi;
 use futures_util::lock::Mutex;
 use lineworks::LineworksApi;
 
@@ -45,6 +49,8 @@ pub struct NotifyState {
     pub pg: Arc<Mutex<PgClient>>,
     /// ippoan/alc-lineworks-worker (Service Binding `ALC_LINEWORKS`)
     pub lineworks: Arc<dyn LineworksApi>,
+    /// Cloudflare Email Routing の API (token と account ID は Secrets Store。無ければ `configured()` が `false`)
+    pub email_routing: Arc<dyn EmailRoutingApi>,
     /// `SSO_ENCRYPTION_KEY` (Secrets Store)。worker は line-config の POST と配信の口でだけ引く (ほかは `None`)
     pub sso_key: Option<Arc<str>>,
     /// 配信の外への送信 (LINE・viewer の KV への登録) に要るもの

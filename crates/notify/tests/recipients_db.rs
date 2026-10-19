@@ -702,3 +702,425 @@ async fn db_failure_is_500_with_fixed_logs() {
         }
     }
 }
+
+// ---- Cloudflare Email Routing の送り先 (Refs ippoan/alc-app#436) ----
+// Cloudflare は MockEmailRouting。送り先を作るのは admin だけ・メールアドレスが新しく入った / 変わったときだけ・
+// 失敗しても保存の応答は変えない・消さない。email-status は 3 状態。
+
+const EMAIL_STATUS: &str = "/api/notify/recipients/email-status";
+
+/// auth-worker の identity のヘッダーで role だけ変える
+fn as_role(t: Uuid, role: &str) -> Vec<(&'static str, String)> {
+    let mut h = identity(t, Uuid::new_v4());
+    h.iter_mut().find(|(k, _)| *k == "X-User-Role").unwrap().1 = role.to_owned();
+    h
+}
+
+fn with_email(name: &str, lw: &str, email: &str) -> Value {
+    json!({"name": name, "provider": "lineworks", "lineworks_user_id": lw, "email": email})
+}
+
+/// 送り先を作るのは admin の POST だけ。Cloudflare に渡すアドレスは前後の空白を削って小文字、DB の値はそのまま
+#[tokio::test]
+async fn email_routing_created_on_admin_post_only() {
+    let t = tenant().await;
+    let app = app().await;
+
+    let admin = identity(t, Uuid::new_v4());
+    let got = call_with(
+        &app,
+        "POST",
+        RECIPIENTS,
+        &admin,
+        Some(with_email("山田", "lw-1", "  Yamada@Example.TEST ")),
+    )
+    .await;
+    assert_eq!(got.status, 201);
+    assert_eq!(got.json()["email"], "  Yamada@Example.TEST ");
+    assert_eq!(app.email.created_emails(), vec!["yamada@example.test"]);
+    let call0 = &app.email.calls()[0];
+    assert!(call0.post);
+    assert_eq!(call0.path, "/email/routing/addresses");
+
+    // admin でない (role が違う・identity のヘッダーが無い) POST は、宛先は保存するが送り先は作らない
+    for (n, headers) in [as_role(t, "member"), vec![("X-Tenant-ID", t.to_string())]]
+        .into_iter()
+        .enumerate()
+    {
+        let got = call_with(
+            &app,
+            "POST",
+            RECIPIENTS,
+            &headers,
+            Some(with_email("佐藤", &format!("lw-s{n}"), "sato@example.test")),
+        )
+        .await;
+        assert_eq!(got.status, 201);
+    }
+    assert_eq!(app.email.created_emails(), vec!["yamada@example.test"]);
+
+    // メールアドレスが無い・空の POST でも作らない
+    for body in [
+        recipient_body("鈴木", "lw-3"),
+        with_email("高橋", "lw-4", "   "),
+    ] {
+        let got = call_with(&app, "POST", RECIPIENTS, &admin, Some(body)).await;
+        assert_eq!(got.status, 201);
+    }
+    assert_eq!(app.email.calls().len(), 1);
+}
+
+/// PUT: アドレスが変わらなければ(大文字小文字・空白の違いは同じとみなす)作らない。変わったら作る。送らなければ作らない。
+/// admin でなければ作らない。行が無ければ 500 (rust と同じ)
+#[tokio::test]
+async fn email_routing_put_only_when_changed() {
+    let t = tenant().await;
+    let app = app().await;
+    let admin = identity(t, Uuid::new_v4());
+    let created = call(
+        &app,
+        "POST",
+        RECIPIENTS,
+        Some(t),
+        Some(with_email("山田", "lw-1", "yamada@example.test")),
+    )
+    .await
+    .json();
+    let uri = format!("{RECIPIENTS}/{}", id(&created));
+    assert!(app.email.calls().is_empty());
+
+    for body in [
+        json!({"email": " YAMADA@example.test"}),
+        json!({"name": "山田 太郎"}),
+    ] {
+        let got = call_with(&app, "PUT", &uri, &admin, Some(body)).await;
+        assert_eq!(got.status, 200);
+    }
+    assert!(app.email.calls().is_empty());
+
+    // 変わった PUT でも admin でなければ作らない
+    let got = call_with(
+        &app,
+        "PUT",
+        &uri,
+        &as_role(t, "member"),
+        Some(json!({"email": "other@example.test"})),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert!(app.email.calls().is_empty());
+
+    let got = call_with(
+        &app,
+        "PUT",
+        &uri,
+        &admin,
+        Some(json!({"email": "New@Example.test"})),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json()["email"], "New@Example.test");
+    assert_eq!(app.email.created_emails(), vec!["new@example.test"]);
+
+    // 行が無い PUT は 500 のまま (送り先は作らない)
+    let got = call_with(
+        &app,
+        "PUT",
+        &format!("{RECIPIENTS}/{}", Uuid::new_v4()),
+        &admin,
+        Some(json!({"email": "none@example.test"})),
+    )
+    .await;
+    assert_eq!(got.status, 500);
+    assert_eq!(app.email.created_emails().len(), 1);
+}
+
+/// bulk: 新しい行のアドレスと、既存の行で変わったアドレスだけ作る (同じアドレスは 1 回)。変わらない行・admin でない呼び手は作らない
+#[tokio::test]
+async fn email_routing_bulk() {
+    let t = tenant().await;
+    let app = app().await;
+    let admin = identity(t, Uuid::new_v4());
+
+    let first = json!({"recipients": [
+        with_email("山田", "lw-1", "yamada@example.test"),
+        with_email("佐藤", "lw-2", "Sato@example.test"),
+        with_email("重複", "lw-3", "sato@example.test"),
+        recipient_body("鈴木", "lw-4"),
+    ]});
+    let got = call_with(
+        &app,
+        "POST",
+        "/api/notify/recipients/bulk",
+        &admin,
+        Some(first),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json()["created"], 4);
+    assert_eq!(
+        app.email.created_emails(),
+        vec!["yamada@example.test", "sato@example.test"]
+    );
+
+    // 2 回目: 山田は同じ(大文字になっただけ)、佐藤は変わった、鈴木は新しく入った
+    let second = json!({"recipients": [
+        with_email("山田", "lw-1", "YAMADA@example.test"),
+        with_email("佐藤", "lw-2", "sato2@example.test"),
+        with_email("鈴木", "lw-4", "suzuki@example.test"),
+    ]});
+    let got = call_with(
+        &app,
+        "POST",
+        "/api/notify/recipients/bulk",
+        &admin,
+        Some(second),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json()["updated"], 3);
+    assert_eq!(
+        app.email.created_emails(),
+        vec![
+            "yamada@example.test",
+            "sato@example.test",
+            "sato2@example.test",
+            "suzuki@example.test"
+        ]
+    );
+
+    // admin でなければ作らない
+    let third = json!({"recipients": [with_email("田中", "lw-5", "tanaka@example.test")]});
+    let got = call_with(
+        &app,
+        "POST",
+        "/api/notify/recipients/bulk",
+        &as_role(t, "member"),
+        Some(third),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert_eq!(app.email.created_emails().len(), 4);
+}
+
+/// Cloudflare が失敗しても(2xx 以外・届かない)宛先の保存の応答は変わらない。既に在る応答はエラーにしない。
+/// 未設定なら Cloudflare を呼ばない。ログは固定の語だけ(アドレス・上流の本文を出さない)
+#[tokio::test]
+async fn email_routing_failure_does_not_change_save() {
+    let t = tenant().await;
+    let app = app().await;
+    let admin = identity(t, Uuid::new_v4());
+    let post = |n: usize| with_email("山田", &format!("lw-{n}"), &format!("user{n}@example.test"));
+
+    app.email
+        .post_reply(500, r#"{"errors":[{"message":"secret upstream text"}]}"#);
+    let got = call_with(&app, "POST", RECIPIENTS, &admin, Some(post(1))).await;
+    assert_eq!(got.status, 201);
+    app.email.post_unreachable("fetch");
+    let got = call_with(&app, "POST", RECIPIENTS, &admin, Some(post(2))).await;
+    assert_eq!(got.status, 201);
+    // 重複 (既に在る) は成功として扱い、ログも出さない
+    app.email.post_reply(
+        400,
+        r#"{"success":false,"errors":[{"code":1,"message":"Destination address already exists"}]}"#,
+    );
+    let got = call_with(&app, "POST", RECIPIENTS, &admin, Some(post(3))).await;
+    assert_eq!(got.status, 201);
+
+    assert_eq!(app.email.calls().len(), 3);
+    assert_eq!(
+        app.logs(),
+        vec![
+            "notify: email routing create failed (status 500)",
+            "notify: email routing create failed (fetch)",
+        ]
+    );
+
+    // 未設定: 保存は成功し、Cloudflare は呼ばれず、ログも出ない
+    let unconfigured = build_with(
+        rt_client().await,
+        Options {
+            email_routing_configured: false,
+            ..Options::default()
+        },
+    );
+    let got = call_with(&unconfigured, "POST", RECIPIENTS, &admin, Some(post(4))).await;
+    assert_eq!(got.status, 201);
+    assert!(unconfigured.email.calls().is_empty());
+    assert!(unconfigured.logs().is_empty());
+}
+
+/// 宛先を消しても Cloudflare の送り先は消さない (消す口を持たない。呼び出しが 1 つも出ない)
+#[tokio::test]
+async fn email_routing_delete_keeps_destination() {
+    let t = tenant().await;
+    let app = app().await;
+    let admin = identity(t, Uuid::new_v4());
+    let created = call_with(
+        &app,
+        "POST",
+        RECIPIENTS,
+        &admin,
+        Some(with_email("山田", "lw-1", "yamada@example.test")),
+    )
+    .await
+    .json();
+    assert_eq!(app.email.calls().len(), 1);
+
+    let got = call_with(
+        &app,
+        "DELETE",
+        &format!("{RECIPIENTS}/{}", id(&created)),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(got.status, 204);
+    assert_eq!(app.email.calls().len(), 1);
+    assert!(app.email.calls().iter().all(|c| c.post));
+}
+
+/// email-status: 送り先が在って確認済み = verified、在るが未確認 = pending、無い = not_registered。
+/// アドレスの無い宛先は載せない。大文字小文字・空白は無視して突き合わせ、一覧は全ページ辿る。
+/// `email-status` は id として読まれない。既存の一覧の JSON は変わらない
+#[tokio::test]
+async fn email_status_three_states() {
+    let t = tenant().await;
+    let app = app().await;
+    let a = create_recipient_with_email(&app, t, "a", "lw-a", "A@example.test").await;
+    let b = create_recipient_with_email(&app, t, "b", "lw-b", " b@example.test").await;
+    let c = create_recipient_with_email(&app, t, "c", "lw-c", "c@example.test").await;
+    create_recipient(&app, t, "d", "lw-d").await;
+    let before = call(&app, "GET", RECIPIENTS, Some(t), None).await.json();
+
+    app.email.then_list(
+        200,
+        r#"{"success":true,"result":[{"id":"1","email":"a@example.test","verified":"2026-01-01T00:00:00Z"}],"result_info":{"page":1,"per_page":50,"total_pages":2}}"#,
+    );
+    app.email.then_list(
+        200,
+        r#"{"success":true,"result":[{"id":"2","email":"B@Example.test","verified":null},{"id":"9","email":"other@example.test","verified":null}],"result_info":{"page":2,"per_page":50,"total_pages":2}}"#,
+    );
+    let got = call(&app, "GET", EMAIL_STATUS, Some(t), None).await;
+    assert_eq!(got.status, 200);
+    let body = got.json();
+    assert_eq!(body["configured"], true);
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items.len(), 3);
+    let status_of = |rid: &str| {
+        items.iter().find(|i| i["recipient_id"] == rid).unwrap()["email_status"].clone()
+    };
+    assert_eq!(status_of(&id(&a)), "verified");
+    assert_eq!(status_of(&id(&b)), "pending");
+    assert_eq!(status_of(&id(&c)), "not_registered");
+    assert_eq!(keys(&items[0]), vec!["email_status", "recipient_id"]);
+
+    // Cloudflare の一覧は 1 回だけ全ページ(2 リクエスト)
+    let gets: Vec<_> = app.email.calls().into_iter().filter(|c| !c.post).collect();
+    assert_eq!(gets.len(), 2);
+    assert_eq!(gets[0].path, "/email/routing/addresses?page=1&per_page=50");
+    assert_eq!(gets[1].path, "/email/routing/addresses?page=2&per_page=50");
+
+    // 既存の一覧は変わらない (email_status を足さない)
+    let after = call(&app, "GET", RECIPIENTS, Some(t), None).await.json();
+    assert_eq!(before, after);
+
+    // 本文の無い成功 (result が null・result_info が無い) は空の一覧として扱う
+    app.email
+        .then_list(200, r#"{"success":true,"result":null}"#);
+    let got = call(&app, "GET", EMAIL_STATUS, Some(t), None).await;
+    assert_eq!(got.status, 200);
+    assert!(got.json()["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|i| i["email_status"] == "not_registered"));
+
+    // tenant が無ければ 401 (ほかの口と同じ)
+    assert_eq!(
+        call(&app, "GET", EMAIL_STATUS, None, None).await.status,
+        401
+    );
+}
+
+async fn create_recipient_with_email(
+    app: &App,
+    t: Uuid,
+    name: &str,
+    lw: &str,
+    email: &str,
+) -> Value {
+    let got = call(
+        app,
+        "POST",
+        RECIPIENTS,
+        Some(t),
+        Some(with_email(name, lw, email)),
+    )
+    .await;
+    assert_eq!(got.status, 201);
+    got.json()
+}
+
+/// 未設定なら 200 `{"configured": false, "items": []}` で Cloudflare を呼ばない
+#[tokio::test]
+async fn email_status_unconfigured() {
+    let t = tenant().await;
+    let app = build_with(
+        rt_client().await,
+        Options {
+            email_routing_configured: false,
+            ..Options::default()
+        },
+    );
+    create_recipient_with_email(&app, t, "a", "lw-a", "a@example.test").await;
+    let got = call(&app, "GET", EMAIL_STATUS, Some(t), None).await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json(), json!({"configured": false, "items": []}));
+    assert!(app.email.calls().is_empty());
+}
+
+/// 一覧の取得に失敗したら 502 (本文は固定の語)。DB が切れていれば 500。ログは固定の語と status か label だけ
+#[tokio::test]
+async fn email_status_failures() {
+    let t = tenant().await;
+    let app = app().await;
+    create_recipient_with_email(&app, t, "a", "lw-a", "secret-addr@example.test").await;
+
+    app.email
+        .then_list(500, r#"{"errors":[{"message":"secret upstream text"}]}"#);
+    app.email.then_list_unreachable("fetch");
+    app.email.then_list(200, "not json");
+    for _ in 0..3 {
+        let got = call(&app, "GET", EMAIL_STATUS, Some(t), None).await;
+        assert_eq!(got.status, 502);
+        assert_eq!(got.json(), json!({"error": "upstream_error"}));
+    }
+    assert_eq!(
+        app.logs(),
+        vec![
+            "notify: email routing list failed (status 500)",
+            "notify: email routing list failed (fetch)",
+            "notify: email routing list failed (body)",
+        ]
+    );
+
+    // DB が切れていれば 500 (Cloudflare は呼ばない)
+    let broken = broken_app().await;
+    let got = call(&broken, "GET", EMAIL_STATUS, Some(t), None).await;
+    assert_eq!(got.status, 500);
+    assert!(broken.email.calls().is_empty());
+    assert!(broken.logs()[0].starts_with("notify: email status list recipients failed: db ("));
+
+    // admin の PUT で保存前の行を読む DB が切れていれば 500 (rust の PUT の 500 と同じ)
+    let got = call_with(
+        &broken,
+        "PUT",
+        &format!("{RECIPIENTS}/{}", Uuid::new_v4()),
+        &identity(t, Uuid::new_v4()),
+        Some(json!({"email": "x@example.test"})),
+    )
+    .await;
+    assert_eq!(got.status, 500);
+    assert!(broken.email.calls().is_empty());
+}

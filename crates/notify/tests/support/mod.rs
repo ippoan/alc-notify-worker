@@ -20,6 +20,7 @@ use axum::Router;
 use futures_util::future::BoxFuture;
 use futures_util::lock::Mutex;
 use notify::distribute::Outbound;
+use notify::email_routing::{EmailRoutingApi, ErRequest, ErResponse, ErUnreachable};
 use notify::http::{Http, HttpError, HttpRequest, HttpResponse};
 use notify::line::{LineEndpoints, LineTokenCache};
 use notify::lineworks::{LineworksApi, LwRequest, LwResponse, LwUnreachable};
@@ -263,6 +264,96 @@ impl LineworksApi for MockLineworks {
     }
 }
 
+/// Cloudflare Email Routing のモック。受けたリクエストを残し、POST には決めた応答、GET には積んだ応答を順に返す
+/// (積んだ分が尽きたら 200 で空の一覧)。`configured` が `false` なら未設定として振る舞う (呼ばれない)
+pub struct MockEmailRouting {
+    pub configured: bool,
+    pub calls: StdMutex<Vec<ErRequest>>,
+    pub post_reply: StdMutex<Result<ErResponse, ErUnreachable>>,
+    pub get_queue: StdMutex<VecDeque<Result<ErResponse, ErUnreachable>>>,
+}
+
+impl MockEmailRouting {
+    fn new(configured: bool) -> Self {
+        Self {
+            configured,
+            calls: StdMutex::new(Vec::new()),
+            post_reply: StdMutex::new(Ok(ErResponse {
+                status: 200,
+                body: b"{}".to_vec(),
+            })),
+            get_queue: StdMutex::new(VecDeque::new()),
+        }
+    }
+
+    /// 以降の POST (送り先を作る) の応答
+    pub fn post_reply(&self, status: u16, body: &str) {
+        *self.post_reply.lock().unwrap() = Ok(ErResponse {
+            status,
+            body: body.as_bytes().to_vec(),
+        });
+    }
+
+    pub fn post_unreachable(&self, label: &'static str) {
+        *self.post_reply.lock().unwrap() = Err(ErUnreachable(label));
+    }
+
+    /// 次の GET (一覧) の応答を 1 つ積む
+    pub fn then_list(&self, status: u16, body: &str) {
+        self.get_queue.lock().unwrap().push_back(Ok(ErResponse {
+            status,
+            body: body.as_bytes().to_vec(),
+        }));
+    }
+
+    pub fn then_list_unreachable(&self, label: &'static str) {
+        self.get_queue
+            .lock()
+            .unwrap()
+            .push_back(Err(ErUnreachable(label)));
+    }
+
+    pub fn calls(&self) -> Vec<ErRequest> {
+        self.calls.lock().unwrap().clone()
+    }
+
+    /// 送り先を作った POST の本文の `email`(呼ばれた順)
+    pub fn created_emails(&self) -> Vec<String> {
+        self.calls()
+            .into_iter()
+            .filter(|c| c.post)
+            .map(|c| {
+                let v: serde_json::Value =
+                    serde_json::from_str(c.body.as_deref().unwrap()).unwrap();
+                v["email"].as_str().unwrap().to_owned()
+            })
+            .collect()
+    }
+}
+
+impl EmailRoutingApi for MockEmailRouting {
+    fn configured(&self) -> bool {
+        self.configured
+    }
+
+    fn call(&self, req: ErRequest) -> BoxFuture<'_, Result<ErResponse, ErUnreachable>> {
+        let reply = if req.post {
+            self.post_reply.lock().unwrap().clone()
+        } else {
+            self.get_queue
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Ok(ErResponse {
+                    status: 200,
+                    body: br#"{"result":[]}"#.to_vec(),
+                }))
+        };
+        self.calls.lock().unwrap().push(req);
+        Box::pin(async move { reply })
+    }
+}
+
 /// [`MockHttp`] の規則 (URL の頭, 本文に含む文字列, 応答)
 type HttpRule = (String, Option<String>, Result<HttpResponse, HttpError>);
 
@@ -372,6 +463,8 @@ pub struct Options {
     pub sso_key: Option<&'static str>,
     pub frontend_url: Option<&'static str>,
     pub viewer_secret: Option<&'static str>,
+    /// Cloudflare Email Routing の token・account ID が在るか
+    pub email_routing_configured: bool,
 }
 
 impl Default for Options {
@@ -380,6 +473,7 @@ impl Default for Options {
             sso_key: Some(TEST_SSO_KEY),
             frontend_url: Some(FRONTEND_URL),
             viewer_secret: Some(VIEWER_SECRET),
+            email_routing_configured: true,
         }
     }
 }
@@ -389,6 +483,7 @@ pub struct App {
     pub logs: Arc<StdMutex<Vec<String>>>,
     pub lineworks: Arc<MockLineworks>,
     pub http: Arc<MockHttp>,
+    pub email: Arc<MockEmailRouting>,
     pub line_tokens: Arc<LineTokenCache>,
 }
 
@@ -425,10 +520,12 @@ pub fn build_with(pg: PgClient, opts: Options) -> App {
         queued: StdMutex::new(VecDeque::new()),
     });
     let http = Arc::new(MockHttp::default());
+    let email = Arc::new(MockEmailRouting::new(opts.email_routing_configured));
     let line_tokens = Arc::new(LineTokenCache::default());
     let state = NotifyState {
         pg: Arc::new(Mutex::new(pg)),
         lineworks: lineworks.clone(),
+        email_routing: email.clone(),
         sso_key: opts.sso_key.map(Arc::from),
         outbound: Outbound {
             http: http.clone(),
@@ -448,6 +545,7 @@ pub fn build_with(pg: PgClient, opts: Options) -> App {
         logs,
         lineworks,
         http,
+        email,
         line_tokens,
     }
 }
