@@ -150,7 +150,8 @@ async fn recipient_crud() {
     assert!(app.logs.lock().unwrap().is_empty());
 }
 
-/// 無い行を直す → 500 (rust の `fetch_one` と同じ)。DB の制約違反 → 500。どちらも本文なし、ログは固定の語と kind だけ
+/// 無い行を直す → 500 (rust の `fetch_one` と同じ)。provider が許す語の外 → 400 `invalid_provider` (DB の CHECK に届かない)。
+/// 500 は本文なし、ログは固定の語と kind だけ
 #[tokio::test]
 async fn recipient_update_missing_and_constraint() {
     let t = tenant().await;
@@ -165,7 +166,7 @@ async fn recipient_update_missing_and_constraint() {
     )
     .await;
     assert_eq!((got.status, got.body.len()), (500, 0));
-    // provider の CHECK 違反
+    // provider の語が許す語の外 (検査で 400。DB には届かない)
     let got = call(
         &app,
         "POST",
@@ -174,14 +175,12 @@ async fn recipient_update_missing_and_constraint() {
         Some(json!({"name": "x", "provider": "mail", "lineworks_user_id": "lw-x"})),
     )
     .await;
-    assert_eq!((got.status, got.body.len()), (500, 0));
+    assert_eq!(got.status, 400);
+    assert_eq!(got.json(), json!({"error": "invalid_provider"}));
     let logs = app.logs.lock().unwrap().clone();
     assert_eq!(
         logs,
-        vec![
-            "notify: update recipient failed: db (other)".to_owned(),
-            "notify: create recipient failed: db (23514)".to_owned(),
-        ]
+        vec!["notify: update recipient failed: db (other)".to_owned()]
     );
     for l in &logs {
         assert!(!l.contains(&t.to_string()) && !l.contains(&missing.to_string()));
@@ -1375,4 +1374,290 @@ async fn resend_upstream_failures() {
             "notify: email routing recreate failed (fetch)",
         ]
     );
+}
+
+// ---- provider 'email' と provider ごとの必須 (Refs ippoan/alc-app#436) ----
+// migration 178 で provider に 'email' が入った。DB の CHECK 違反を 500 にしないため、POST / PUT は先に 400 の固定の語で断る。
+// PUT は既存の行と合成して検査する (送らなかった項目は COALESCE で既存の値のまま)。
+
+fn error_of(got: &Got) -> Value {
+    got.json()["error"].clone()
+}
+
+/// POST: provider が許す語の外は `invalid_provider`、provider ごとの必須 (空・空白だけも空) が無ければ 400。何も保存しない
+#[tokio::test]
+async fn recipient_post_requires_per_provider_field() {
+    let t = tenant().await;
+    let app = app().await;
+    let cases = [
+        (
+            json!({"name": "x", "provider": "sms", "email": "a@example.test"}),
+            "invalid_provider",
+        ),
+        (
+            json!({"name": "x", "provider": "", "lineworks_user_id": "lw"}),
+            "invalid_provider",
+        ),
+        (
+            json!({"name": "x", "provider": "line"}),
+            "line_user_id_required",
+        ),
+        (
+            json!({"name": "x", "provider": "line", "line_user_id": ""}),
+            "line_user_id_required",
+        ),
+        (
+            json!({"name": "x", "provider": "line", "line_user_id": "  "}),
+            "line_user_id_required",
+        ),
+        // 別の provider の ID があっても、自分の provider の ID が無ければ断る
+        (
+            json!({"name": "x", "provider": "line", "lineworks_user_id": "lw"}),
+            "line_user_id_required",
+        ),
+        (
+            json!({"name": "x", "provider": "lineworks"}),
+            "lineworks_user_id_required",
+        ),
+        (
+            json!({"name": "x", "provider": "lineworks", "lineworks_user_id": ""}),
+            "lineworks_user_id_required",
+        ),
+        (
+            json!({"name": "x", "provider": "lineworks", "lineworks_user_id": " \t"}),
+            "lineworks_user_id_required",
+        ),
+        (
+            json!({"name": "x", "provider": "lineworks", "line_user_id": "U"}),
+            "lineworks_user_id_required",
+        ),
+        (json!({"name": "x", "provider": "email"}), "email_required"),
+        (
+            json!({"name": "x", "provider": "email", "email": ""}),
+            "email_required",
+        ),
+        (
+            json!({"name": "x", "provider": "email", "email": "   "}),
+            "email_required",
+        ),
+        (
+            json!({"name": "x", "provider": "email", "lineworks_user_id": "lw"}),
+            "email_required",
+        ),
+    ];
+    for (body, want) in cases {
+        let got = call(&app, "POST", RECIPIENTS, Some(t), Some(body.clone())).await;
+        assert_eq!(got.status, 400, "{body}");
+        assert_eq!(error_of(&got), want, "{body}");
+    }
+    let got = call(&app, "GET", RECIPIENTS, Some(t), None).await;
+    assert_eq!(got.json(), json!([]));
+    assert!(app.logs.lock().unwrap().is_empty());
+    assert!(app.email.calls().is_empty());
+}
+
+/// provider 'email' の宛先: メールアドレスだけで作れる (201)。ID の列は null。一覧・1 件で読める。admin なら送り先を作る
+#[tokio::test]
+async fn email_provider_recipient_create_and_update() {
+    let t = tenant().await;
+    let app = app().await;
+    let admin = identity(t, Uuid::new_v4());
+    let got = call_with(
+        &app,
+        "POST",
+        RECIPIENTS,
+        &admin,
+        Some(json!({"name": "メール太郎", "provider": "email", "email": "Taro@Example.test"})),
+    )
+    .await;
+    assert_eq!(got.status, 201);
+    let r = got.json();
+    assert_eq!(r["provider"], "email");
+    assert_eq!(r["email"], "Taro@Example.test");
+    assert_eq!(r["lineworks_user_id"], Value::Null);
+    assert_eq!(r["line_user_id"], Value::Null);
+    assert_eq!(app.email.created_emails(), vec!["taro@example.test"]);
+    let path = format!("{RECIPIENTS}/{}", id(&r));
+
+    // 名前だけ直す (provider・email は既存のまま) → 200
+    let got = call_with(
+        &app,
+        "PUT",
+        &path,
+        &admin,
+        Some(json!({"name": "メール次郎"})),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json()["email"], "Taro@Example.test");
+    // email を空白にする → 400 (既存の値ではなく入力を見る)。行は変わらない
+    for blank in ["", "   "] {
+        let got = call_with(&app, "PUT", &path, &admin, Some(json!({"email": blank}))).await;
+        assert_eq!((got.status, error_of(&got)), (400, json!("email_required")));
+    }
+    let got = call_with(&app, "GET", &path, &admin, None).await;
+    assert_eq!(got.json()["email"], "Taro@Example.test");
+    // 別のアドレスに変える → 200、送り先を作る
+    let got = call_with(
+        &app,
+        "PUT",
+        &path,
+        &admin,
+        Some(json!({"email": "jiro@example.test"})),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert_eq!(
+        app.email.created_emails(),
+        vec!["taro@example.test", "jiro@example.test"]
+    );
+    // lineworks に変えるなら lineworks_user_id が要る。送れば通る
+    let got = call_with(
+        &app,
+        "PUT",
+        &path,
+        &admin,
+        Some(json!({"provider": "lineworks"})),
+    )
+    .await;
+    assert_eq!(
+        (got.status, error_of(&got)),
+        (400, json!("lineworks_user_id_required"))
+    );
+    let got = call_with(
+        &app,
+        "PUT",
+        &path,
+        &admin,
+        Some(json!({"provider": "lineworks", "lineworks_user_id": "lw-j"})),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json()["provider"], "lineworks");
+    assert!(app.logs.lock().unwrap().is_empty());
+}
+
+/// PUT は既存の行と合成して検査する: provider だけ送っても既存の項目で足りれば通り、足りなければ 400。語の外は `invalid_provider`
+#[tokio::test]
+async fn recipient_put_validates_merged_row() {
+    let t = tenant().await;
+    let app = app().await;
+    // lineworks の宛先 (email あり) と (email なし)
+    let with = create_recipient_with_email(&app, t, "あり", "lw-a", "a@example.test").await;
+    let without = create_recipient(&app, t, "なし", "lw-b").await;
+    let (with_path, without_path) = (
+        format!("{RECIPIENTS}/{}", id(&with)),
+        format!("{RECIPIENTS}/{}", id(&without)),
+    );
+
+    // provider だけ送る: email が既存の行は通る
+    let got = call(
+        &app,
+        "PUT",
+        &with_path,
+        Some(t),
+        Some(json!({"provider": "email"})),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json()["provider"], "email");
+    // email が無い行は 400 (行は lineworks のまま)
+    let got = call(
+        &app,
+        "PUT",
+        &without_path,
+        Some(t),
+        Some(json!({"provider": "email"})),
+    )
+    .await;
+    assert_eq!((got.status, error_of(&got)), (400, json!("email_required")));
+    let got = call(&app, "GET", &without_path, Some(t), None).await;
+    assert_eq!(got.json()["provider"], "lineworks");
+    // line の ID が無い行を line に
+    let got = call(
+        &app,
+        "PUT",
+        &without_path,
+        Some(t),
+        Some(json!({"provider": "line"})),
+    )
+    .await;
+    assert_eq!(
+        (got.status, error_of(&got)),
+        (400, json!("line_user_id_required"))
+    );
+    let got = call(
+        &app,
+        "PUT",
+        &without_path,
+        Some(t),
+        Some(json!({"provider": "line", "line_user_id": "U-b"})),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    // provider の語の外
+    let got = call(
+        &app,
+        "PUT",
+        &without_path,
+        Some(t),
+        Some(json!({"provider": "sms"})),
+    )
+    .await;
+    assert_eq!(
+        (got.status, error_of(&got)),
+        (400, json!("invalid_provider"))
+    );
+    // lineworks の行の lineworks_user_id を空にする
+    let got = call(
+        &app,
+        "PUT",
+        &with_path,
+        Some(t),
+        Some(json!({"provider": "lineworks"})),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    let got = call(
+        &app,
+        "PUT",
+        &with_path,
+        Some(t),
+        Some(json!({"lineworks_user_id": " "})),
+    )
+    .await;
+    assert_eq!(
+        (got.status, error_of(&got)),
+        (400, json!("lineworks_user_id_required"))
+    );
+    assert!(app.logs.lock().unwrap().is_empty());
+}
+
+/// admin でなくても email の宛先は作れる・直せる。送り先は作らない (任意のアドレスに確認メールが飛ぶため)
+#[tokio::test]
+async fn email_provider_non_admin_saves_without_destination() {
+    let t = tenant().await;
+    let app = app().await;
+    let member = as_role(t, "member");
+    let got = call_with(
+        &app,
+        "POST",
+        RECIPIENTS,
+        &member,
+        Some(json!({"name": "メール", "provider": "email", "email": "m@example.test"})),
+    )
+    .await;
+    assert_eq!(got.status, 201);
+    let path = format!("{RECIPIENTS}/{}", id(&got.json()));
+    let got = call_with(
+        &app,
+        "PUT",
+        &path,
+        &member,
+        Some(json!({"email": "n@example.test"})),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json()["email"], "n@example.test");
+    assert!(app.email.calls().is_empty());
 }

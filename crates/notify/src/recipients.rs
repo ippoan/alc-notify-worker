@@ -3,10 +3,10 @@
 //! | method | path | 成功 |
 //! |---|---|---|
 //! | GET | `/api/notify/recipients` | 200 名前の順の配列 |
-//! | POST | `/api/notify/recipients` | 201 作った行 |
+//! | POST | `/api/notify/recipients` | 201 作った行 (provider が `line` / `lineworks` / `email` 以外・provider ごとの必須が空なら 400 `invalid_provider` / `line_user_id_required` / `lineworks_user_id_required` / `email_required`。rust に無い検査) |
 //! | POST | `/api/notify/recipients/bulk` | 200 `{created, updated, skipped, touched_recipient_ids}` |
 //! | GET | `/api/notify/recipients/{id}` | 200 / 無ければ 404 |
-//! | PUT | `/api/notify/recipients/{id}` | 200 直した行 (無ければ 500。rust と同じ) |
+//! | PUT | `/api/notify/recipients/{id}` | 200 直した行 (無ければ 500。rust と同じ。既存の行と合成して POST と同じ 400 の検査) |
 //! | DELETE | `/api/notify/recipients/{id}` | 204 (無くても 204) |
 //! | POST | `/api/notify/recipients/{id}/resend-verification` | 200 `{"status":"created"|"resent"}` / 409 `already_verified` (本文なし。admin だけ。rust に無い口。[`crate::email_routing`]) |
 //! | GET | `/api/notify/recipients/email-status` | 200 `{configured, items: [{recipient_id, email_status}]}` (rust に無い口。[`crate::email_routing`]) |
@@ -20,6 +20,7 @@ use alc_core_wasm::api_error::{internal_error_msg, ApiError};
 use alc_core_wasm::{AuthUser, TenantId};
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::Deserialize;
@@ -175,17 +176,48 @@ async fn get_one(
     Ok(Json(json!(recipient)))
 }
 
+/// provider ごとの必須項目を検査する (`line` は line_user_id・`lineworks` は lineworks_user_id・`email` は email。空白だけも空)。
+/// DB の CHECK (`at_least_one_messaging_id`) 違反を 500 にしないため、400 の固定の語を返す。
+/// DB の失敗の 500 は従来どおり本文なしなので、create / update の戻り型は `Response`
+fn validate_destination(
+    provider: &str,
+    lineworks_user_id: Option<&str>,
+    line_user_id: Option<&str>,
+    email: Option<&str>,
+) -> Result<(), &'static str> {
+    let blank = |v: Option<&str>| v.is_none_or(|s| s.trim().is_empty());
+    let missing = match provider {
+        "line" => blank(line_user_id).then_some("line_user_id_required"),
+        "lineworks" => blank(lineworks_user_id).then_some("lineworks_user_id_required"),
+        "email" => blank(email).then_some("email_required"),
+        _ => Some("invalid_provider"),
+    };
+    missing.map_or(Ok(()), Err)
+}
+
+/// 検査の失敗の語を 400 `{"error": <語>}` にする
+fn bad_request(error: &'static str) -> Response {
+    (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response()
+}
+
 async fn create(
     State(state): State<NotifyState>,
     Extension(tenant): Extension<TenantId>,
     auth_user: Option<Extension<AuthUser>>,
     Json(input): Json<CreateNotifyRecipient>,
-) -> Result<(StatusCode, Json<Value>), StatusCode> {
+) -> Result<(StatusCode, Json<Value>), Response> {
+    validate_destination(
+        &input.provider,
+        input.lineworks_user_id.as_deref(),
+        input.line_user_id.as_deref(),
+        input.email.as_deref(),
+    )
+    .map_err(bad_request)?;
     let recipient = {
         let mut pg = state.pg.lock().await;
         pg::create_recipient(&mut pg, tenant.0, input).await
     }
-    .map_err(|e| state.db_fail("create recipient", &e))?;
+    .map_err(|e| state.db_fail("create recipient", &e).into_response())?;
     if let Some(email) = changed_email(is_admin(&auth_user), None, recipient.email.as_deref()) {
         state.ensure_destination(&email).await;
     }
@@ -198,25 +230,39 @@ async fn update(
     auth_user: Option<Extension<AuthUser>>,
     Path(id): Path<Uuid>,
     Json(input): Json<UpdateNotifyRecipient>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<Value>, Response> {
     let admin = is_admin(&auth_user);
-    // メールアドレスを送ってきたときだけ、保存前の行を読んで比べる (送らなければ COALESCE で変わらない)
+    // メールアドレスを送ってきたときだけ、保存前のメールアドレスを比べる (送らなければ COALESCE で変わらない)
     let check_email = admin && input.email.is_some();
+    let fail = |e: &_| state.db_fail("update recipient", e).into_response();
     let recipient = {
         let mut pg = state.pg.lock().await;
-        let before = if check_email {
-            pg::get_recipient(&mut pg, tenant.0, id)
-                .await
-                .map_err(|e| state.db_fail("update recipient", &e))?
-                .and_then(|r| r.email)
-        } else {
-            None
-        };
+        // 既存の行を読み、入力 (送らなかった項目は既存の値のまま = COALESCE) と合成してから検査する。
+        // 行が無ければ検査せず、update が従来どおり失敗する
+        let existing = pg::get_recipient(&mut pg, tenant.0, id)
+            .await
+            .map_err(|e| fail(&e))?;
+        if let Some(cur) = &existing {
+            validate_destination(
+                input.provider.as_deref().unwrap_or(&cur.provider),
+                input
+                    .lineworks_user_id
+                    .as_deref()
+                    .or(cur.lineworks_user_id.as_deref()),
+                input
+                    .line_user_id
+                    .as_deref()
+                    .or(cur.line_user_id.as_deref()),
+                input.email.as_deref().or(cur.email.as_deref()),
+            )
+            .map_err(bad_request)?;
+        }
+        let before = existing.and_then(|r| r.email).filter(|_| check_email);
         pg::update_recipient(&mut pg, tenant.0, id, input)
             .await
             .map(|r| (before, r))
     }
-    .map_err(|e| state.db_fail("update recipient", &e))?;
+    .map_err(|e| fail(&e))?;
     let (before, recipient) = recipient;
     if let Some(email) = changed_email(check_email, before.as_deref(), recipient.email.as_deref()) {
         state.ensure_destination(&email).await;
