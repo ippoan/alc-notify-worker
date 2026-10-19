@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
-use notify::email_routing::{EmailRoutingApi, ErRequest, ErResponse, ErUnreachable};
+use notify::email_routing::{EmailRoutingApi, ErMethod, ErRequest, ErResponse, ErUnreachable};
 use wasm_bindgen::JsValue;
 use worker::send::SendFuture;
 use worker::{Fetch, Headers, Method, Request, RequestInit, RequestRedirect};
@@ -43,14 +43,20 @@ impl EmailRoutingApi for CloudflareEmailRouting {
                 .set("Accept", "application/json")
                 .map_err(|_| ErUnreachable("headers"))?;
             let mut init = RequestInit::new();
-            if req.post {
-                headers
-                    .set("Content-Type", "application/json")
-                    .map_err(|_| ErUnreachable("headers"))?;
-                init.with_method(Method::Post)
-                    .with_body(req.body.as_deref().map(JsValue::from_str));
-            } else {
-                init.with_method(Method::Get);
+            match req.method {
+                ErMethod::Post => {
+                    headers
+                        .set("Content-Type", "application/json")
+                        .map_err(|_| ErUnreachable("headers"))?;
+                    init.with_method(Method::Post)
+                        .with_body(req.body.as_deref().map(JsValue::from_str));
+                }
+                ErMethod::Get => {
+                    init.with_method(Method::Get);
+                }
+                ErMethod::Delete => {
+                    init.with_method(Method::Delete);
+                }
             }
             init.with_headers(headers)
                 .with_redirect(RequestRedirect::Manual);

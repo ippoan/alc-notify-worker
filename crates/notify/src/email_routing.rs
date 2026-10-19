@@ -7,13 +7,16 @@
 //! | 操作 | Cloudflare の API |
 //! |---|---|
 //! | 送り先を作る | `POST /accounts/{account_id}/email/routing/addresses` 本文 `{"email": ...}` |
-//! | 送り先の一覧 | `GET /accounts/{account_id}/email/routing/addresses?page=&per_page=` (応答の `result[].verified` が確認日時。未確認は null。`result_info` は `page`・`per_page`・`count`・`total_count` だけで `total_pages` を持たない。ページ数は `total_count` から数える) |
+//! | 送り先の一覧 | `GET /accounts/{account_id}/email/routing/addresses?page=&per_page=` (応答の `result[].id` が送り先の ID、`result[].verified` が確認日時。未確認は null。`result_info` は `page`・`per_page`・`count`・`total_count` だけで `total_pages` を持たない。ページ数は `total_count` から数える) |
+//! | 送り先を消す (再送のときの未確認のものだけ) | `DELETE /accounts/{account_id}/email/routing/addresses/{id}` |
 //!
 //! - token と account ID は worker が Secrets Store から引く。引けなければ [`EmailRoutingApi::configured`] が `false` で、
 //!   Cloudflare は呼ばない (宛先の保存は止めない)。
 //! - 送り先を作るのは best-effort: 失敗しても宛先の保存の応答は変えない。ログは固定の語と status か label だけ
 //!   (メールアドレス・上流の本文・識別子を出さない)。
-//! - 送り先は消さない (アカウント全体で共有で、他の tenant も使うことがあるため)。
+//! - 送り先は消さない (アカウント全体で共有で、他の tenant も使うことがあるため)。例外は確認メールの再送
+//!   ([`NotifyState::resend_verification`]): Cloudflare に再送の API が無いので、**未確認の**送り先に限り消して作り直す
+//!   (作り直しで確認メールが再び飛ぶ)。確認済みの送り先は消さない。
 
 use std::collections::HashMap;
 
@@ -32,12 +35,20 @@ const PER_PAGE: u32 = 50;
 /// 一覧を辿るページ数の上限 (応答の件数が壊れていても止まる)
 const MAX_PAGES: u32 = 200;
 
+/// Cloudflare への要求の method
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErMethod {
+    Get,
+    /// `body` を JSON で送る
+    Post,
+    Delete,
+}
+
 /// Cloudflare への 1 リクエスト。認証と account は実装が付ける
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ErRequest {
-    /// `true` = POST (`body` を JSON で送る)、`false` = GET
-    pub post: bool,
-    /// [`ADDRESSES_PATH`] (と query)
+    pub method: ErMethod,
+    /// [`ADDRESSES_PATH`] (と query、または `/{id}`)
     pub path: String,
     pub body: Option<String>,
 }
@@ -97,8 +108,25 @@ struct ListBody {
 
 #[derive(Deserialize)]
 struct Address {
+    id: String,
     email: String,
     verified: Option<String>,
+}
+
+/// 一覧の 1 件: Cloudflare の送り先の ID と、確認済みか
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Destination {
+    pub id: String,
+    pub verified: bool,
+}
+
+impl From<Address> for Destination {
+    fn from(a: Address) -> Self {
+        Self {
+            id: a.id,
+            verified: a.verified.is_some(),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -122,6 +150,21 @@ fn page_count(info: &ResultInfo) -> u32 {
 #[derive(Debug, PartialEq, Eq)]
 pub struct ListFailed;
 
+/// 確認メールの再送の結果
+#[derive(Debug, PartialEq, Eq)]
+pub enum Resend {
+    /// 送り先が無かったので作った (確認メールが飛ぶ)
+    Created,
+    /// 未確認の送り先を消して作り直した (確認メールが再び飛ぶ)
+    Resent,
+    /// 確認済み。消さない・作らない
+    AlreadyVerified,
+}
+
+/// 再送の途中で Cloudflare が失敗した (ログは失敗した段で出し済み)
+#[derive(Debug, PartialEq, Eq)]
+pub struct ResendFailed;
+
 impl NotifyState {
     /// 送り先を作る (best-effort)。未設定・空のアドレスなら何もしない。既に在る応答は成功として扱う
     pub(crate) async fn ensure_destination(&self, email: &str) {
@@ -129,32 +172,76 @@ impl NotifyState {
         if email.is_empty() || !self.email_routing.configured() {
             return;
         }
+        let _ = self.create_destination(&email, "create").await;
+    }
+
+    /// 送り先を 1 つ作る (`email` は正規化済み)。既に在る応答は成功。失敗は `notify: email routing <stage> failed (..)` をログに出す
+    async fn create_destination(&self, email: &str, stage: &str) -> Result<(), ResendFailed> {
         let req = ErRequest {
-            post: true,
+            method: ErMethod::Post,
             path: ADDRESSES_PATH.to_owned(),
             body: Some(json!({ "email": email }).to_string()),
         };
+        self.call_ok(req, stage, is_already_exists).await
+    }
+
+    /// 1 リクエストを打ち、2xx (と `also_ok` の応答) なら成功。失敗は固定の語と label か status だけをログに出す
+    async fn call_ok(
+        &self,
+        req: ErRequest,
+        stage: &str,
+        also_ok: fn(&ErResponse) -> bool,
+    ) -> Result<(), ResendFailed> {
         match self.email_routing.call(req).await {
             Err(ErUnreachable(label)) => {
-                (self.log)(&format!("notify: email routing create failed ({label})"));
+                (self.log)(&format!("notify: email routing {stage} failed ({label})"));
+                Err(ResendFailed)
             }
-            Ok(resp) if (200..300).contains(&resp.status) || is_already_exists(&resp) => {}
+            Ok(resp) if (200..300).contains(&resp.status) || also_ok(&resp) => Ok(()),
             Ok(resp) => {
                 (self.log)(&format!(
-                    "notify: email routing create failed (status {})",
+                    "notify: email routing {stage} failed (status {})",
                     resp.status
                 ));
+                Err(ResendFailed)
             }
         }
     }
 
-    /// 送り先の全件を引く: 正規化したメールアドレス → 確認済みか。ページを全部辿る
-    pub(crate) async fn list_destinations(&self) -> Result<HashMap<String, bool>, ListFailed> {
+    /// 確認メールを再送する (`email` は空でないこと。呼び手が未設定でないことを確かめ済み)。
+    /// 送り先が無ければ作る・未確認なら消して作り直す・確認済みなら何もしない (消さない)。
+    /// 消した後に作るのが失敗したら、送り先が消えたままなのでログの語を `recreate` にして見分ける
+    pub(crate) async fn resend_verification(&self, email: &str) -> Result<Resend, ResendFailed> {
+        let email = normalize_email(email);
+        let destinations = self.list_destinations().await.map_err(|_| ResendFailed)?;
+        match destinations.get(&email) {
+            None => {
+                self.create_destination(&email, "create").await?;
+                Ok(Resend::Created)
+            }
+            Some(Destination { verified: true, .. }) => Ok(Resend::AlreadyVerified),
+            Some(Destination { id, .. }) => {
+                let req = ErRequest {
+                    method: ErMethod::Delete,
+                    path: format!("{ADDRESSES_PATH}/{id}"),
+                    body: None,
+                };
+                self.call_ok(req, "delete", |_| false).await?;
+                self.create_destination(&email, "recreate").await?;
+                Ok(Resend::Resent)
+            }
+        }
+    }
+
+    /// 送り先の全件を引く: 正規化したメールアドレス → 送り先の ID と確認済みか。ページを全部辿る
+    pub(crate) async fn list_destinations(
+        &self,
+    ) -> Result<HashMap<String, Destination>, ListFailed> {
         let mut out = HashMap::new();
         let mut page = 1;
         loop {
             let req = ErRequest {
-                post: false,
+                method: ErMethod::Get,
                 path: format!("{ADDRESSES_PATH}?page={page}&per_page={PER_PAGE}"),
                 body: None,
             };
@@ -178,7 +265,7 @@ impl NotifyState {
                 ListFailed
             })?;
             for a in body.result.unwrap_or_default() {
-                out.insert(normalize_email(&a.email), a.verified.is_some());
+                out.insert(normalize_email(&a.email), Destination::from(a));
             }
             let total = body.result_info.as_ref().map_or(1, page_count);
             if page >= total.min(MAX_PAGES) {
@@ -213,6 +300,45 @@ mod tests {
         assert_eq!(page_count(&info(None, Some(51))), 2);
         assert_eq!(page_count(&info(None, Some(120))), 3);
         assert_eq!(page_count(&info(None, None)), 1);
+    }
+
+    #[test]
+    fn list_body_reads_id_and_verified() {
+        let body: ListBody = serde_json::from_str(
+            r#"{"result":[{"id":"aa11","email":"a@example.test","verified":"2026-01-01T00:00:00Z","created":"x"},{"id":"bb22","email":"b@example.test","verified":null}],"result_info":{"page":1,"per_page":50,"count":2,"total_count":2}}"#,
+        )
+        .unwrap();
+        let got: Vec<Destination> = body
+            .result
+            .unwrap()
+            .into_iter()
+            .map(Destination::from)
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                Destination {
+                    id: "aa11".to_owned(),
+                    verified: true
+                },
+                Destination {
+                    id: "bb22".to_owned(),
+                    verified: false
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn methods_are_distinct() {
+        let req = |method| ErRequest {
+            method,
+            path: ADDRESSES_PATH.to_owned(),
+            body: None,
+        };
+        assert_ne!(req(ErMethod::Get), req(ErMethod::Post));
+        assert_ne!(req(ErMethod::Post), req(ErMethod::Delete));
+        assert_eq!(format!("{:?}", ErMethod::Delete), "Delete");
     }
 
     #[test]
@@ -253,6 +379,10 @@ mod tests {
             "/api/notify/recipients/x"
         ));
         assert!(needs_email_routing(&Method::GET, EMAIL_STATUS_PATH));
+        assert!(needs_email_routing(
+            &Method::POST,
+            "/api/notify/recipients/x/resend-verification"
+        ));
         assert!(!needs_email_routing(&Method::GET, RECIPIENTS_PATH));
         assert!(!needs_email_routing(
             &Method::DELETE,

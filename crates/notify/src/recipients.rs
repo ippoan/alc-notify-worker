@@ -8,6 +8,7 @@
 //! | GET | `/api/notify/recipients/{id}` | 200 / 無ければ 404 |
 //! | PUT | `/api/notify/recipients/{id}` | 200 直した行 (無ければ 500。rust と同じ) |
 //! | DELETE | `/api/notify/recipients/{id}` | 204 (無くても 204) |
+//! | POST | `/api/notify/recipients/{id}/resend-verification` | 200 `{"status":"created"|"resent"}` / 409 `already_verified` (本文なし。admin だけ。rust に無い口。[`crate::email_routing`]) |
 //! | GET | `/api/notify/recipients/email-status` | 200 `{configured, items: [{recipient_id, email_status}]}` (rust に無い口。[`crate::email_routing`]) |
 //!
 //! POST / PUT / bulk で、メールアドレスが新しく入った・変わったときは、保存の後に Cloudflare Email Routing の送り先を作る
@@ -25,7 +26,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::email_routing::normalize_email;
+use crate::email_routing::{normalize_email, Resend};
 use crate::pg::{self, CreateNotifyRecipient, UpdateNotifyRecipient};
 use crate::{groups, NotifyState};
 
@@ -33,6 +34,7 @@ pub const RECIPIENTS_PATH: &str = "/api/notify/recipients";
 pub const RECIPIENTS_BULK_PATH: &str = "/api/notify/recipients/bulk";
 pub const RECIPIENT_PATH: &str = "/api/notify/recipients/{id}";
 pub const EMAIL_STATUS_PATH: &str = "/api/notify/recipients/email-status";
+pub const RESEND_VERIFICATION_PATH: &str = "/api/notify/recipients/{id}/resend-verification";
 
 /// 送り先を作ってよい呼び手か (auth-worker が付ける `X-User-Role`。任意のアドレスに Cloudflare の確認メールが飛ぶため)
 fn is_admin(auth_user: &Option<Extension<AuthUser>>) -> bool {
@@ -46,6 +48,7 @@ pub fn router() -> Router<NotifyState> {
         .route(RECIPIENTS_PATH, get(list).post(create))
         .route(RECIPIENTS_BULK_PATH, post(bulk_upsert))
         .route(EMAIL_STATUS_PATH, get(email_status))
+        .route(RESEND_VERIFICATION_PATH, post(resend_verification))
         .route(RECIPIENT_PATH, get(get_one).put(update).delete(delete))
 }
 
@@ -268,12 +271,51 @@ async fn email_status(
         .into_iter()
         .filter_map(|r| {
             let status = match destinations.get(&normalize_email(r.email.as_deref()?)) {
-                Some(true) => "verified",
-                Some(false) => "pending",
+                Some(d) if d.verified => "verified",
+                Some(_) => "pending",
                 None => "not_registered",
             };
             Some(json!({"recipient_id": r.id, "email_status": status}))
         })
         .collect();
     Ok(Json(json!({"configured": true, "items": items})))
+}
+
+/// 宛先のメールアドレスの確認メールを再送する (Cloudflare に再送の API が無いので、未確認の送り先を消して作り直す)。
+/// admin でなければ 403、宛先が無ければ 404、メールアドレスが無い・空なら 400 `no_email`、Cloudflare が未設定なら 503 `not_configured`。
+/// 送り先が無ければ作って `created`、未確認なら消して作り直して `resent`、確認済みなら消さずに 409 `already_verified`。
+/// Cloudflare の失敗は 502 `upstream_error` (本文は固定の語)
+async fn resend_verification(
+    State(state): State<NotifyState>,
+    Extension(tenant): Extension<TenantId>,
+    auth_user: Option<Extension<AuthUser>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let err = |status, error: &str| (status, Json(json!({ "error": error })));
+    if !is_admin(&auth_user) {
+        return Err(err(StatusCode::FORBIDDEN, "forbidden"));
+    }
+    let recipient = {
+        let mut pg = state.pg.lock().await;
+        pg::get_recipient(&mut pg, tenant.0, id)
+            .await
+            .map_err(|e| {
+                state.db_fail("resend verification get recipient", &e);
+                internal_error_msg("get_recipient_failed")
+            })?
+    }
+    .ok_or_else(|| err(StatusCode::NOT_FOUND, "not_found"))?;
+    let email = normalize_email(recipient.email.as_deref().unwrap_or_default());
+    if email.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "no_email"));
+    }
+    if !state.email_routing.configured() {
+        return Err(err(StatusCode::SERVICE_UNAVAILABLE, "not_configured"));
+    }
+    match state.resend_verification(&email).await {
+        Ok(Resend::Created) => Ok(Json(json!({"status": "created"}))),
+        Ok(Resend::Resent) => Ok(Json(json!({"status": "resent"}))),
+        Ok(Resend::AlreadyVerified) => Err(err(StatusCode::CONFLICT, "already_verified")),
+        Err(_) => Err(err(StatusCode::BAD_GATEWAY, "upstream_error")),
+    }
 }
