@@ -1461,11 +1461,12 @@ async fn recipient_post_requires_per_provider_field() {
 async fn email_provider_recipient_create_and_update() {
     let t = tenant().await;
     let app = app().await;
-    let got = call(
+    let admin = identity(t, Uuid::new_v4());
+    let got = call_with(
         &app,
         "POST",
         RECIPIENTS,
-        Some(t),
+        &admin,
         Some(json!({"name": "メール太郎", "provider": "email", "email": "Taro@Example.test"})),
     )
     .await;
@@ -1479,11 +1480,11 @@ async fn email_provider_recipient_create_and_update() {
     let path = format!("{RECIPIENTS}/{}", id(&r));
 
     // 名前だけ直す (provider・email は既存のまま) → 200
-    let got = call(
+    let got = call_with(
         &app,
         "PUT",
         &path,
-        Some(t),
+        &admin,
         Some(json!({"name": "メール次郎"})),
     )
     .await;
@@ -1491,17 +1492,17 @@ async fn email_provider_recipient_create_and_update() {
     assert_eq!(got.json()["email"], "Taro@Example.test");
     // email を空白にする → 400 (既存の値ではなく入力を見る)。行は変わらない
     for blank in ["", "   "] {
-        let got = call(&app, "PUT", &path, Some(t), Some(json!({"email": blank}))).await;
+        let got = call_with(&app, "PUT", &path, &admin, Some(json!({"email": blank}))).await;
         assert_eq!((got.status, error_of(&got)), (400, json!("email_required")));
     }
-    let got = call(&app, "GET", &path, Some(t), None).await;
+    let got = call_with(&app, "GET", &path, &admin, None).await;
     assert_eq!(got.json()["email"], "Taro@Example.test");
     // 別のアドレスに変える → 200、送り先を作る
-    let got = call(
+    let got = call_with(
         &app,
         "PUT",
         &path,
-        Some(t),
+        &admin,
         Some(json!({"email": "jiro@example.test"})),
     )
     .await;
@@ -1511,11 +1512,11 @@ async fn email_provider_recipient_create_and_update() {
         vec!["taro@example.test", "jiro@example.test"]
     );
     // lineworks に変えるなら lineworks_user_id が要る。送れば通る
-    let got = call(
+    let got = call_with(
         &app,
         "PUT",
         &path,
-        Some(t),
+        &admin,
         Some(json!({"provider": "lineworks"})),
     )
     .await;
@@ -1523,11 +1524,11 @@ async fn email_provider_recipient_create_and_update() {
         (got.status, error_of(&got)),
         (400, json!("lineworks_user_id_required"))
     );
-    let got = call(
+    let got = call_with(
         &app,
         "PUT",
         &path,
-        Some(t),
+        &admin,
         Some(json!({"provider": "lineworks", "lineworks_user_id": "lw-j"})),
     )
     .await;
