@@ -1,5 +1,5 @@
 //! crates/notify の [`EmailRoutingApi`] の Workers での実装: Cloudflare の API (`api.cloudflare.com`) を、Secrets Store の
-//! token (`CF_EMAIL_ROUTING_TOKEN`、権限は Email Routing Addresses Edit) と account ID (`CF_ACCOUNT_ID`) で呼ぶ。
+//! token (`CF_EMAIL_ROUTING_TOKEN`、権限は Email Routing Addresses Edit) と `[vars]` の account ID (`CF_ACCOUNT_ID`) で呼ぶ。
 //! 型は `src/http.rs` の `WorkerHttp` と同じ (`worker::Fetch`、redirect は辿らない、`SendFuture` で包む)。
 //!
 //! token・account ID・URL・ヘッダー・ランタイムの生のエラー文はログに出さない (エラーは段の label だけに落とす)。
