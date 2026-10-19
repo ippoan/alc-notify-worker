@@ -7,13 +7,15 @@
 //!
 //! LINE WORKS の API は ippoan/alc-lineworks-worker を Service Binding `ALC_LINEWORKS` で呼ぶ ([`lineworks`])。
 //! 秘密値 `SSO_ENCRYPTION_KEY` (Secrets Store) は line-config の POST と配信の口でだけ、`INTERNAL_SHARED_SECRET`
-//! (Secrets Store、viewer の register-view の認証) は配信の口でだけ引く。配信の外への POST (LINE・viewer) は [`http`]。
+//! (Secrets Store、viewer の register-view の認証) は配信の口でだけ引く。`CF_EMAIL_ROUTING_TOKEN`・`CF_ACCOUNT_ID` (Secrets Store、
+//! Cloudflare Email Routing の送り先の登録) は宛先の保存と email-status の口でだけ引く ([`email_routing`])。配信の外への POST (LINE・viewer) は [`http`]。
 
 // worker 本体は wasm32 専用。native の `cargo build` / `clippy` / `test` (workspace の root で打つもの) では空の crate にして、
 // crates/notify だけを検査させる
 #![cfg(target_arch = "wasm32")]
 
 mod db;
+mod email_routing;
 mod http;
 mod lineworks;
 mod tcp;
@@ -24,6 +26,7 @@ use axum::body::Body;
 use axum::http::{HeaderValue, Method, Response, StatusCode};
 use futures_util::lock::Mutex;
 use notify::distribute::{is_distribute_request, Outbound};
+use notify::email_routing::{needs_email_routing, EmailRoutingApi};
 use notify::line::{LineEndpoints, LineTokenCache};
 use notify::line_config::LINE_CONFIG_PATH;
 use notify::lineworks::LineworksApi;
@@ -33,6 +36,7 @@ use worker::{
     console_error, event, Context, Date, Env, HttpRequest, Result, WorkerVersionMetadata,
 };
 
+use crate::email_routing::{CloudflareEmailRouting, NoEmailRouting};
 use crate::http::WorkerHttp;
 use crate::lineworks::{LineworksBinding, NoLineworks};
 
@@ -44,6 +48,11 @@ const ALC_LINEWORKS_BINDING: &str = "ALC_LINEWORKS";
 const INTERNAL_SHARED_SECRET_BINDING: &str = "INTERNAL_SHARED_SECRET";
 /// viewer の Worker (ippoan/nuxt-notify) の公開 URL (wrangler.toml の vars)
 const NOTIFY_FRONTEND_URL_VAR: &str = "NOTIFY_FRONTEND_URL";
+
+/// Cloudflare Email Routing の API の token (Secrets Store。権限は Email Routing Addresses Edit)
+const CF_EMAIL_ROUTING_TOKEN_BINDING: &str = "CF_EMAIL_ROUTING_TOKEN";
+/// Cloudflare の account ID (Secrets Store)
+const CF_ACCOUNT_ID_BINDING: &str = "CF_ACCOUNT_ID";
 
 /// LINE の channel access token の置き場 (isolate の間ずっと持つ。キーは channel ごと)
 fn line_tokens() -> Arc<LineTokenCache> {
@@ -71,6 +80,20 @@ fn lineworks_api(env: &Env) -> Arc<dyn LineworksApi> {
     match env.service(ALC_LINEWORKS_BINDING) {
         Ok(fetcher) => Arc::new(LineworksBinding::new(fetcher)),
         Err(_) => Arc::new(NoLineworks),
+    }
+}
+
+/// 宛先の保存と email-status の口でだけ Secrets Store を引く。どちらかが無い・読めないときは未設定 (Cloudflare は呼ばない)
+async fn email_routing_api(env: &Env, needed: bool) -> Arc<dyn EmailRoutingApi> {
+    if !needed {
+        return Arc::new(NoEmailRouting);
+    }
+    match (
+        secret(env, CF_EMAIL_ROUTING_TOKEN_BINDING).await,
+        secret(env, CF_ACCOUNT_ID_BINDING).await,
+    ) {
+        (Some(token), Some(account_id)) => Arc::new(CloudflareEmailRouting::new(token, account_id)),
+        _ => Arc::new(NoEmailRouting),
     }
 }
 
@@ -117,6 +140,8 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
     } else {
         None
     };
+    let email_routing =
+        email_routing_api(&env, needs_email_routing(req.method(), req.uri().path())).await;
     let outbound = Outbound {
         http: Arc::new(WorkerHttp),
         line_endpoints: LineEndpoints::default(),
@@ -131,6 +156,7 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
     let state = NotifyState {
         pg: Arc::new(Mutex::new(pg)),
         lineworks: lineworks_api(&env),
+        email_routing,
         sso_key,
         outbound,
         log: log_sink(),

@@ -58,6 +58,19 @@ binding = "INTERNAL_SHARED_SECRET"
 store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
 secret_name = "INTERNAL_SHARED_SECRET"
 
+# 宛先のメールアドレスを Cloudflare Email Routing の送り先として登録する API の token (Email Routing Addresses Edit) と account ID
+# (src/email_routing.rs。宛先の保存と GET /api/notify/recipients/email-status でだけ引く。値は repo に無い)。
+# 無い・読めないときは Cloudflare を呼ばない。binding は env に継承されないので staging にも書く
+[[secrets_store_secrets]]
+binding = "CF_EMAIL_ROUTING_TOKEN"
+store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
+secret_name = "cf-email-routing-token"
+
+[[secrets_store_secrets]]
+binding = "CF_ACCOUNT_ID"
+store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
+secret_name = "cf-account-id"
+
 # 配信のメッセージに載せる viewer のページ・画像の URL と、register-view の宛先 (rust-alc-api の cloudrun/render.sh の
 # NOTIFY_FRONTEND_URL と同じ値)。利用者に配る公開の URL なので平文で書く (ippoan/nuxt-notify の wrangler.jsonc にも在る)。
 # vars は env に継承されないので staging は下で別に書く
@@ -102,6 +115,16 @@ service = "alc-lineworks-staging"
 binding = "INTERNAL_SHARED_SECRET"
 store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
 secret_name = "INTERNAL_SHARED_SECRET"
+
+[[env.staging.secrets_store_secrets]]
+binding = "CF_EMAIL_ROUTING_TOKEN"
+store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
+secret_name = "cf-email-routing-token"
+
+[[env.staging.secrets_store_secrets]]
+binding = "CF_ACCOUNT_ID"
+store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
+secret_name = "cf-account-id"
 
 [env.staging.vars]
 NOTIFY_FRONTEND_URL = "https://notify-staging.ippoan.org"

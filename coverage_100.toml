@@ -52,3 +52,7 @@ path = "crates/notify/src/viewer_register.rs"
 # 外への POST の口 (trait と応答)
 [[files]]
 path = "crates/notify/src/http.rs"
+
+# Cloudflare Email Routing の送り先 (宛先のメールアドレスの登録と確認の状態。API はモック)
+[[files]]
+path = "crates/notify/src/email_routing.rs"
