@@ -7,7 +7,7 @@
 //! | 操作 | Cloudflare の API |
 //! |---|---|
 //! | 送り先を作る | `POST /accounts/{account_id}/email/routing/addresses` 本文 `{"email": ...}` |
-//! | 送り先の一覧 | `GET /accounts/{account_id}/email/routing/addresses?page=&per_page=` (応答の `result[].verified` が確認日時。未確認は null、`result_info.total_pages` がページ数) |
+//! | 送り先の一覧 | `GET /accounts/{account_id}/email/routing/addresses?page=&per_page=` (応答の `result[].verified` が確認日時。未確認は null。`result_info` は `page`・`per_page`・`count`・`total_count` だけで `total_pages` を持たない。ページ数は `total_count` から数える) |
 //!
 //! - token と account ID は worker が Secrets Store から引く。引けなければ [`EmailRoutingApi::configured`] が `false` で、
 //!   Cloudflare は呼ばない (宛先の保存は止めない)。
@@ -29,7 +29,7 @@ use crate::NotifyState;
 pub const ADDRESSES_PATH: &str = "/email/routing/addresses";
 /// 一覧の 1 ページの件数 (Cloudflare の上限)
 const PER_PAGE: u32 = 50;
-/// 一覧を辿るページ数の上限 (応答の `total_pages` が壊れていても止まる)
+/// 一覧を辿るページ数の上限 (応答の件数が壊れていても止まる)
 const MAX_PAGES: u32 = 200;
 
 /// Cloudflare への 1 リクエスト。認証と account は実装が付ける
@@ -103,7 +103,19 @@ struct Address {
 
 #[derive(Deserialize)]
 struct ResultInfo {
-    total_pages: u32,
+    /// 資料にはあるが本物の応答には無い。在れば優先する
+    total_pages: Option<u32>,
+    total_count: Option<u32>,
+}
+
+/// 一覧のページ数: `total_pages` があればそれ、無ければ `total_count` を `PER_PAGE` で割って切り上げ (0 件は 1)、
+/// どちらも無ければ 1
+fn page_count(info: &ResultInfo) -> u32 {
+    match (info.total_pages, info.total_count) {
+        (Some(pages), _) => pages,
+        (None, Some(count)) => count.div_ceil(PER_PAGE).max(1),
+        (None, None) => 1,
+    }
 }
 
 /// 一覧の取得の失敗 (ログは取得した段で出し済み)
@@ -168,7 +180,7 @@ impl NotifyState {
             for a in body.result.unwrap_or_default() {
                 out.insert(normalize_email(&a.email), a.verified.is_some());
             }
-            let total = body.result_info.map_or(1, |i| i.total_pages);
+            let total = body.result_info.as_ref().map_or(1, page_count);
             if page >= total.min(MAX_PAGES) {
                 return Ok(out);
             }
@@ -186,6 +198,21 @@ mod tests {
             status,
             body: body.as_bytes().to_vec(),
         }
+    }
+
+    #[test]
+    fn page_count_prefers_total_pages_then_counts_total_count() {
+        let info = |total_pages, total_count| ResultInfo {
+            total_pages,
+            total_count,
+        };
+        assert_eq!(page_count(&info(Some(3), Some(1))), 3);
+        assert_eq!(page_count(&info(Some(2), None)), 2);
+        assert_eq!(page_count(&info(None, Some(0))), 1);
+        assert_eq!(page_count(&info(None, Some(50))), 1);
+        assert_eq!(page_count(&info(None, Some(51))), 2);
+        assert_eq!(page_count(&info(None, Some(120))), 3);
+        assert_eq!(page_count(&info(None, None)), 1);
     }
 
     #[test]

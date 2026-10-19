@@ -8,6 +8,7 @@ Cloud Run (rust-alc-api) に残っている。** 型は ippoan/alc-lineworks-wor
 いまの口 (path・method・JSON・status は rust と同じ。nuxt-notify と auth-worker がそのまま使う):
 - `/api/notify/recipients` (GET / POST)・`/bulk` (POST)・`/{id}` (GET / PUT / DELETE)・`/email-status` (GET。rust に無い口。
   宛先のメールアドレスの Cloudflare Email Routing の送り先としての状態 `verified` / `pending` / `not_registered`。未設定なら `{configured:false}`)
+  **Cloudflare の送り先一覧 (`GET .../email/routing/addresses`) の応答の `result_info` は `total_pages` を持たない (資料と違う)。ページ数は `total_count` を 50 で割って数える。**
 - `/api/notify/groups` (GET / POST)・`/{id}` (GET / PUT / DELETE)・`/{id}/members` (GET / POST)・`/{id}/members/{recipient_id}` (DELETE)
 - `/api/notify/line-config` (GET / POST / DELETE。POST は秘密値を `SSO_ENCRYPTION_KEY` で暗号化。GET は暗号文を返さない)
 - `/api/notify/lineworks/channels` (GET)・`/{id}` (DELETE)・`/{id}/test-send` (POST)

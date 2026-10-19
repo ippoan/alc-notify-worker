@@ -982,7 +982,8 @@ async fn email_routing_delete_keeps_destination() {
 
 /// email-status: 送り先が在って確認済み = verified、在るが未確認 = pending、無い = not_registered。
 /// アドレスの無い宛先は載せない。大文字小文字・空白は無視して突き合わせ、一覧は全ページ辿る。
-/// `email-status` は id として読まれない。既存の一覧の JSON は変わらない
+/// 偽物の応答は本物の形 (`result_info` は page・per_page・count・total_count だけで total_pages 無し。
+/// ページ数は total_count から数える)。`email-status` は id として読まれない。既存の一覧の JSON は変わらない
 #[tokio::test]
 async fn email_status_three_states() {
     let t = tenant().await;
@@ -995,11 +996,11 @@ async fn email_status_three_states() {
 
     app.email.then_list(
         200,
-        r#"{"success":true,"result":[{"id":"1","email":"a@example.test","verified":"2026-01-01T00:00:00Z"}],"result_info":{"page":1,"per_page":50,"total_pages":2}}"#,
+        r#"{"success":true,"result":[{"id":"1","email":"a@example.test","verified":"2026-01-01T00:00:00Z"}],"result_info":{"page":1,"per_page":50,"count":1,"total_count":51}}"#,
     );
     app.email.then_list(
         200,
-        r#"{"success":true,"result":[{"id":"2","email":"B@Example.test","verified":null},{"id":"9","email":"other@example.test","verified":null}],"result_info":{"page":2,"per_page":50,"total_pages":2}}"#,
+        r#"{"success":true,"result":[{"id":"2","email":"B@Example.test","verified":null},{"id":"9","email":"other@example.test","verified":null}],"result_info":{"page":2,"per_page":50,"count":1,"total_count":51}}"#,
     );
     let got = call(&app, "GET", EMAIL_STATUS, Some(t), None).await;
     assert_eq!(got.status, 200);
