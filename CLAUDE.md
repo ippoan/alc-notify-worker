@@ -9,7 +9,8 @@ Cloud Run (rust-alc-api) に残っている。** 型は ippoan/alc-lineworks-wor
 - `/api/notify/recipients/{id}/resend-verification` (POST。本文なし。確認メールの再送。rust に無い口。admin だけ。無ければ作って `{status:"created"}`、
   未確認なら消して作り直して `{status:"resent"}`、確認済みは消さず 409 `already_verified`。宛先なし 404・メールなし 400 `no_email`・Cloudflare 未設定 503 `not_configured`・
   Cloudflare の失敗 502 `upstream_error`。消した後の作成の失敗はログの語が `recreate`。Cloudflare に再送の API が無いための代わり)
-- `/api/notify/recipients` (GET / POST)・`/bulk` (POST)・`/{id}` (GET / PUT / DELETE)・`/email-status` (GET。rust に無い口。
+- `/api/notify/recipients` (GET / POST。POST と PUT は provider が `line` / `lineworks` / `email` 以外なら 400 `invalid_provider`、
+  provider ごとの必須が空なら 400 `line_user_id_required` / `lineworks_user_id_required` / `email_required`。rust に無い検査)・`/bulk` (POST)・`/{id}` (GET / PUT / DELETE)・`/email-status` (GET。rust に無い口。
   宛先のメールアドレスの Cloudflare Email Routing の送り先としての状態 `verified` / `pending` / `not_registered`。未設定なら `{configured:false}`)
   **Cloudflare の送り先一覧 (`GET .../email/routing/addresses`) の応答の `result_info` は `total_pages` を持たない (資料と違う)。ページ数は `total_count` を 50 で割って数える。**
 - `/api/notify/groups` (GET / POST)・`/{id}` (GET / PUT / DELETE)・`/{id}/members` (GET / POST)・`/{id}/members/{recipient_id}` (DELETE)
@@ -55,8 +56,8 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
 - DB は `PgClient::tenant_tx` + `query_typed` 系だけ。SQL は `crates/notify/src/pg.rs` の 1 か所。
   名前付き prepared statement 禁止。Row を transaction の外へ持ち出さない (owned な型に `TxOutput`)。
   tenant_id の列が在る表は WHERE にも tenant_id を書く。
-- rust に無い検査 (role など) を足さない。rust と違う振る舞いにするときは理由を書く (いまは 4 つ: (1) members の POST と bulk のグループ追加は、宛先が同じ tenant に無ければ何も足さない。POST は 404。RLS の WITH CHECK が group の tenant しか見ないため。(2) LINE WORKS の口の失敗の本文は lineworks-worker の status と語 (`error`・`missing_scope` の `scope`・語の形の `message`) だけを写し、自由文 (rust の 502 の `message`) は載せない。tenant に bot が無いときの語は lineworks-worker の `bot_config_not_found` (rust は `no_lineworks_config`。画面は status しか見ない)。ログに上流の文を出さないため。(3) 宛先の保存で Cloudflare の送り先を作るのは `X-User-Role` が `admin` のときだけ (それ以外は宛先は保存するが送り先は作らない)。任意のアドレスに Cloudflare の確認メールが飛ぶため。`email-status` は読むだけなので role を見ない。(4) 確認メールの再送は、未確認の送り先に限り消して作り直す (Cloudflare に再送の API が無いため。確認済みは消さない。「宛先を消しても・変えても送り先は消さない」の、未確認に限った例外。ユーザー決定 2026-10-19))。
-- `coverage_100.toml` の登録を外さない。CI の本数 (recipients_db 21・lineworks_db 7・distribute_db 9。
+- rust に無い検査 (role など) を足さない。rust と違う振る舞いにするときは理由を書く (いまは 5 つ: (1) members の POST と bulk のグループ追加は、宛先が同じ tenant に無ければ何も足さない。POST は 404。RLS の WITH CHECK が group の tenant しか見ないため。(2) LINE WORKS の口の失敗の本文は lineworks-worker の status と語 (`error`・`missing_scope` の `scope`・語の形の `message`) だけを写し、自由文 (rust の 502 の `message`) は載せない。tenant に bot が無いときの語は lineworks-worker の `bot_config_not_found` (rust は `no_lineworks_config`。画面は status しか見ない)。ログに上流の文を出さないため。(3) 宛先の保存で Cloudflare の送り先を作るのは `X-User-Role` が `admin` のときだけ (それ以外は宛先は保存するが送り先は作らない)。任意のアドレスに Cloudflare の確認メールが飛ぶため。`email-status` は読むだけなので role を見ない。(4) 確認メールの再送は、未確認の送り先に限り消して作り直す (Cloudflare に再送の API が無いため。確認済みは消さない。「宛先を消しても・変えても送り先は消さない」の、未確認に限った例外。ユーザー決定 2026-10-19)；(5) 宛先の POST / PUT は provider ごとの必須を検査して 400 (`line` は line_user_id・`lineworks` は lineworks_user_id・`email` は email。空白だけも空。PUT は既存の行と入力を合成して検査する。理由: 画面を経由しない呼び出しでも DB の CHECK `at_least_one_messaging_id` 違反の 500 にしないため。bulk は LINE WORKS の一括登録なので変えない)。加えて provider `email` の宛先は文書配信の対象外 (全員・グループ・指定のどれでも delivery 行も送信も作らない。LINE / LINE WORKS の ID を持たないため。`send_to_recipient` の `UnknownProvider` はそのまま))。
+- `coverage_100.toml` の登録を外さない。CI の本数 (recipients_db 25・lineworks_db 7・distribute_db 10。
   `.github/workflows/ci.yml` の gate) はテストを足したら上げる。
 - public repo: ホスト名・account ID・tenant UUID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
   例外: 利用者に配る公開の viewer URL `NOTIFY_FRONTEND_URL` は wrangler.toml の `[vars]` に平文で置く

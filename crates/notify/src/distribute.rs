@@ -262,19 +262,24 @@ async fn resolve_target_recipients(
     target: &DistributeTarget,
 ) -> Result<Vec<NotifyRecipient>, StatusCode> {
     let mut pg = state.pg.lock().await;
-    if let Some(group_id) = target.group_id {
-        return pg::list_enabled_members(&mut pg, tenant_id, group_id)
+    let mut targets = if let Some(group_id) = target.group_id {
+        pg::list_enabled_members(&mut pg, tenant_id, group_id)
             .await
-            .map_err(|e| state.db_fail("list group members", &e));
-    }
-    let all = pg::list_enabled_recipients(&mut pg, tenant_id)
-        .await
-        .map_err(|e| state.db_fail("list recipients", &e))?;
-    if target.recipient_ids.is_empty() {
-        return Ok(all);
-    }
-    let want: HashSet<Uuid> = target.recipient_ids.iter().copied().collect();
-    Ok(all.into_iter().filter(|r| want.contains(&r.id)).collect())
+            .map_err(|e| state.db_fail("list group members", &e))?
+    } else {
+        let all = pg::list_enabled_recipients(&mut pg, tenant_id)
+            .await
+            .map_err(|e| state.db_fail("list recipients", &e))?;
+        if target.recipient_ids.is_empty() {
+            all
+        } else {
+            let want: HashSet<Uuid> = target.recipient_ids.iter().copied().collect();
+            all.into_iter().filter(|r| want.contains(&r.id)).collect()
+        }
+    };
+    // provider 'email' の宛先は文書配信の対象外 (delivery 行も作らず、送りもしない)
+    targets.retain(|r| r.provider != "email");
+    Ok(targets)
 }
 
 /// viewer のページ (rust の `read_tracker::build_view_url`)

@@ -57,7 +57,7 @@ async fn recipient(
     id
 }
 
-/// CHECK (provider IN ('lineworks', 'line')) の外の宛先 (rust に在る分岐を通すため)。制約を外して 1 行入れ、
+/// CHECK (provider IN ('lineworks', 'line', 'email')) の外の宛先 (rust に在る分岐を通すため)。制約を外して 1 行入れ、
 /// 同じ transaction で `NOT VALID` で戻す (ほかの接続から制約が無い時は見えない。以後の行は今までどおり検査される)
 async fn unknown_provider_recipient(t: Uuid) {
     admin()
@@ -67,7 +67,7 @@ async fn unknown_provider_recipient(t: Uuid) {
              ALTER TABLE alc_api.notify_recipients DROP CONSTRAINT notify_recipients_provider_check; \
              INSERT INTO alc_api.notify_recipients (tenant_id, name, provider, lineworks_user_id) VALUES ('{t}', 'a', 'sms', 'lw-a'); \
              ALTER TABLE alc_api.notify_recipients ADD CONSTRAINT notify_recipients_provider_check \
-               CHECK (provider IN ('lineworks', 'line')) NOT VALID; \
+               CHECK (provider IN ('lineworks', 'line', 'email')) NOT VALID; \
              COMMIT;"
         ))
         .await
@@ -370,6 +370,70 @@ async fn distribute_target_selection() {
             assert_eq!(got.json(), json!({"sent": n, "failed": 0, "total": n}));
         }
     }
+}
+
+/// provider 'email' の宛先は文書配信の対象外: 全員・グループ・指定のどれでも delivery 行も送信も作らない
+#[tokio::test]
+async fn distribute_skips_email_recipients() {
+    let t = tenant().await;
+    let a = lw(t, "a").await;
+    let mail = Uuid::new_v4();
+    admin()
+        .await
+        .execute(
+            "INSERT INTO alc_api.notify_recipients (id, tenant_id, name, provider, email) \
+             VALUES ($1, $2, 'mail', 'email', 'm@example.test')",
+            &[&mail, &t],
+        )
+        .await
+        .unwrap();
+    let g = group(t, &[a, mail]).await;
+    let app = app().await;
+
+    let cases: Vec<(Value, Vec<Uuid>)> = vec![
+        (json!({}), vec![a]),
+        (json!({"target": {"group_id": g}}), vec![a]),
+        (json!({"target": {"recipient_ids": [a, mail]}}), vec![a]),
+        (json!({"target": {"recipient_ids": [mail]}}), vec![]),
+    ];
+    let mut sends = 0;
+    for (body, want) in cases {
+        let doc = document(t, Doc::default()).await;
+        let got = call(
+            &app,
+            "POST",
+            &distribute_path(doc),
+            Some(t),
+            Some(body.clone()),
+        )
+        .await;
+        assert_eq!(got.status, 200, "{body}");
+        let ids: Vec<Uuid> = deliveries(doc)
+            .await
+            .iter()
+            .map(|d| d.recipient_id)
+            .collect();
+        assert_eq!(ids, want, "{body}");
+        sends += want.len();
+        assert_eq!(app.lineworks.calls().len(), sends, "{body}");
+    }
+
+    // email の宛先しかいない tenant: 配る相手がいない
+    let only = tenant().await;
+    admin()
+        .await
+        .execute(
+            "INSERT INTO alc_api.notify_recipients (tenant_id, name, provider, email) \
+             VALUES ($1, 'mail', 'email', 'm@example.test')",
+            &[&only],
+        )
+        .await
+        .unwrap();
+    let doc = document(only, Doc::default()).await;
+    let got = call(&app, "POST", &distribute_path(doc), Some(only), None).await;
+    assert_eq!(got.json(), json!({"message": "No enabled recipients"}));
+    assert!(deliveries(doc).await.is_empty());
+    assert_eq!(app.lineworks.calls().len(), sends);
 }
 
 /// LINE WORKS 宛の text だけの配信: deliveries・viewer の登録・lineworks-worker の本文 (bot_config_id 無し)・
