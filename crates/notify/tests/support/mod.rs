@@ -20,7 +20,7 @@ use axum::Router;
 use futures_util::future::BoxFuture;
 use futures_util::lock::Mutex;
 use notify::distribute::Outbound;
-use notify::email_routing::{EmailRoutingApi, ErRequest, ErResponse, ErUnreachable};
+use notify::email_routing::{EmailRoutingApi, ErMethod, ErRequest, ErResponse, ErUnreachable};
 use notify::http::{Http, HttpError, HttpRequest, HttpResponse};
 use notify::line::{LineEndpoints, LineTokenCache};
 use notify::lineworks::{LineworksApi, LwRequest, LwResponse, LwUnreachable};
@@ -264,12 +264,14 @@ impl LineworksApi for MockLineworks {
     }
 }
 
-/// Cloudflare Email Routing のモック。受けたリクエストを残し、POST には決めた応答、GET には積んだ応答を順に返す
-/// (積んだ分が尽きたら 200 で空の一覧)。`configured` が `false` なら未設定として振る舞う (呼ばれない)
+/// Cloudflare Email Routing のモック。受けたリクエストを残し、POST には決めた応答、DELETE には決めた応答、GET には積んだ応答を順に返す
+/// (積んだ分が尽きたら 200 で空の一覧)。POST は [`MockEmailRouting::then_post`] で積んだ応答を先に 1 つずつ返す。`configured` が `false` なら未設定として振る舞う (呼ばれない)
 pub struct MockEmailRouting {
     pub configured: bool,
     pub calls: StdMutex<Vec<ErRequest>>,
     pub post_reply: StdMutex<Result<ErResponse, ErUnreachable>>,
+    pub post_queue: StdMutex<VecDeque<Result<ErResponse, ErUnreachable>>>,
+    pub delete_reply: StdMutex<Result<ErResponse, ErUnreachable>>,
     pub get_queue: StdMutex<VecDeque<Result<ErResponse, ErUnreachable>>>,
 }
 
@@ -282,8 +284,38 @@ impl MockEmailRouting {
                 status: 200,
                 body: b"{}".to_vec(),
             })),
+            post_queue: StdMutex::new(VecDeque::new()),
+            delete_reply: StdMutex::new(Ok(ErResponse {
+                status: 200,
+                body: b"{}".to_vec(),
+            })),
             get_queue: StdMutex::new(VecDeque::new()),
         }
+    }
+
+    /// 次の POST 1 回だけの応答を積む (積んだ順に返す)
+    pub fn then_post(&self, status: u16, body: &str) {
+        self.post_queue.lock().unwrap().push_back(Ok(ErResponse {
+            status,
+            body: body.as_bytes().to_vec(),
+        }));
+    }
+
+    /// 以降の DELETE (送り先を消す) の応答
+    pub fn delete_reply(&self, status: u16, body: &str) {
+        *self.delete_reply.lock().unwrap() = Ok(ErResponse {
+            status,
+            body: body.as_bytes().to_vec(),
+        });
+    }
+
+    pub fn delete_unreachable(&self, label: &'static str) {
+        *self.delete_reply.lock().unwrap() = Err(ErUnreachable(label));
+    }
+
+    /// 呼ばれた method の列 (呼ばれた順)
+    pub fn methods(&self) -> Vec<ErMethod> {
+        self.calls().into_iter().map(|c| c.method).collect()
     }
 
     /// 以降の POST (送り先を作る) の応答
@@ -321,7 +353,7 @@ impl MockEmailRouting {
     pub fn created_emails(&self) -> Vec<String> {
         self.calls()
             .into_iter()
-            .filter(|c| c.post)
+            .filter(|c| c.method == ErMethod::Post)
             .map(|c| {
                 let v: serde_json::Value =
                     serde_json::from_str(c.body.as_deref().unwrap()).unwrap();
@@ -337,17 +369,21 @@ impl EmailRoutingApi for MockEmailRouting {
     }
 
     fn call(&self, req: ErRequest) -> BoxFuture<'_, Result<ErResponse, ErUnreachable>> {
-        let reply = if req.post {
-            self.post_reply.lock().unwrap().clone()
-        } else {
-            self.get_queue
+        let reply = match req.method {
+            ErMethod::Post => {
+                let queued = self.post_queue.lock().unwrap().pop_front();
+                queued.unwrap_or_else(|| self.post_reply.lock().unwrap().clone())
+            }
+            ErMethod::Delete => self.delete_reply.lock().unwrap().clone(),
+            ErMethod::Get => self
+                .get_queue
                 .lock()
                 .unwrap()
                 .pop_front()
                 .unwrap_or(Ok(ErResponse {
                     status: 200,
                     body: br#"{"result":[]}"#.to_vec(),
-                }))
+                })),
         };
         self.calls.lock().unwrap().push(req);
         Box::pin(async move { reply })

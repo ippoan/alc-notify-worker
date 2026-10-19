@@ -4,6 +4,7 @@
 
 mod support;
 
+use notify::email_routing::ErMethod;
 use serde_json::{json, Value};
 use support::*;
 use uuid::Uuid;
@@ -739,7 +740,7 @@ async fn email_routing_created_on_admin_post_only() {
     assert_eq!(got.json()["email"], "  Yamada@Example.TEST ");
     assert_eq!(app.email.created_emails(), vec!["yamada@example.test"]);
     let call0 = &app.email.calls()[0];
-    assert!(call0.post);
+    assert_eq!(call0.method, ErMethod::Post);
     assert_eq!(call0.path, "/email/routing/addresses");
 
     // admin でない (role が違う・identity のヘッダーが無い) POST は、宛先は保存するが送り先は作らない
@@ -977,7 +978,7 @@ async fn email_routing_delete_keeps_destination() {
     .await;
     assert_eq!(got.status, 204);
     assert_eq!(app.email.calls().len(), 1);
-    assert!(app.email.calls().iter().all(|c| c.post));
+    assert!(app.email.calls().iter().all(|c| c.method == ErMethod::Post));
 }
 
 /// email-status: 送り先が在って確認済み = verified、在るが未確認 = pending、無い = not_registered。
@@ -1017,7 +1018,12 @@ async fn email_status_three_states() {
     assert_eq!(keys(&items[0]), vec!["email_status", "recipient_id"]);
 
     // Cloudflare の一覧は 1 回だけ全ページ(2 リクエスト)
-    let gets: Vec<_> = app.email.calls().into_iter().filter(|c| !c.post).collect();
+    let gets: Vec<_> = app
+        .email
+        .calls()
+        .into_iter()
+        .filter(|c| c.method == ErMethod::Get)
+        .collect();
     assert_eq!(gets.len(), 2);
     assert_eq!(gets[0].path, "/email/routing/addresses?page=1&per_page=50");
     assert_eq!(gets[1].path, "/email/routing/addresses?page=2&per_page=50");
@@ -1124,4 +1130,249 @@ async fn email_status_failures() {
     .await;
     assert_eq!(got.status, 500);
     assert!(broken.email.calls().is_empty());
+}
+
+// ---- 確認メールの再送 (Refs ippoan/alc-app#436) ----
+// Cloudflare に再送の API が無いので、未確認の送り先に限り消して作り直す。確認済みは消さない。
+// 偽物の一覧の応答は本物の形 (result_info に total_pages 無し・id あり・verified は文字列か null)。
+
+fn resend_uri(rid: &str) -> String {
+    format!("{RECIPIENTS}/{rid}/resend-verification")
+}
+
+/// 本物の形の一覧の応答 (1 件)
+fn list_one(dest_id: &str, email: &str, verified: Option<&str>) -> String {
+    json!({
+        "success": true,
+        "result": [{"id": dest_id, "email": email, "verified": verified}],
+        "result_info": {"page": 1, "per_page": 50, "count": 1, "total_count": 1},
+    })
+    .to_string()
+}
+
+/// admin でなければ 403 (ヘッダー無しも)、宛先が無い・他の tenant の宛先は 404、メールアドレスが無い・空は 400、
+/// Cloudflare が未設定なら 503。どれも Cloudflare を呼ばない
+#[tokio::test]
+async fn resend_preconditions() {
+    let t = tenant().await;
+    let other = tenant().await;
+    let app = app().await;
+    let with = create_recipient_with_email(&app, t, "a", "lw-a", "a@example.test").await;
+    let none = create_recipient(&app, t, "b", "lw-b").await;
+    let blank = create_recipient_with_email(&app, t, "c", "lw-c", "   ").await;
+    let foreign = create_recipient_with_email(&app, other, "d", "lw-d", "d@example.test").await;
+    let admin = identity(t, Uuid::new_v4());
+    let calls_before = app.email.calls().len();
+
+    for headers in [as_role(t, "member"), vec![("X-Tenant-ID", t.to_string())]] {
+        let got = call_with(&app, "POST", &resend_uri(&id(&with)), &headers, None).await;
+        assert_eq!(got.status, 403);
+        assert_eq!(got.json(), json!({"error": "forbidden"}));
+    }
+    let got = call_with(
+        &app,
+        "POST",
+        &resend_uri(&Uuid::new_v4().to_string()),
+        &admin,
+        None,
+    )
+    .await;
+    assert_eq!(got.status, 404);
+    // 他の tenant の宛先は見えない
+    let got = call_with(&app, "POST", &resend_uri(&id(&foreign)), &admin, None).await;
+    assert_eq!(got.status, 404);
+    for r in [&none, &blank] {
+        let got = call_with(&app, "POST", &resend_uri(&id(r)), &admin, None).await;
+        assert_eq!(got.status, 400);
+        assert_eq!(got.json(), json!({"error": "no_email"}));
+    }
+    assert_eq!(app.email.calls().len(), calls_before);
+
+    let unconfigured = build_with(
+        rt_client().await,
+        Options {
+            email_routing_configured: false,
+            ..Options::default()
+        },
+    );
+    let got = call_with(&unconfigured, "POST", &resend_uri(&id(&with)), &admin, None).await;
+    assert_eq!(got.status, 503);
+    assert_eq!(got.json(), json!({"error": "not_configured"}));
+    assert!(unconfigured.email.calls().is_empty());
+    assert!(unconfigured.logs().is_empty());
+
+    // DB が切れていれば 500 (Cloudflare は呼ばない)
+    let broken = broken_app().await;
+    let got = call_with(&broken, "POST", &resend_uri(&id(&with)), &admin, None).await;
+    assert_eq!(got.status, 500);
+    assert!(broken.email.calls().is_empty());
+    assert!(broken.logs()[0].starts_with("notify: resend verification get recipient failed: db ("));
+}
+
+/// 送り先が無ければ作る (POST 1 回。DELETE はしない)。アドレスは正規化して渡す
+#[tokio::test]
+async fn resend_creates_when_missing() {
+    let t = tenant().await;
+    let app = app().await;
+    let r = create_recipient_with_email(&app, t, "a", "lw-a", " A@Example.TEST").await;
+    let admin = identity(t, Uuid::new_v4());
+    // 保存の POST (member なので作られない) の後に数える
+    assert!(app.email.calls().is_empty());
+
+    app.email
+        .then_list(200, &list_one("zz", "other@example.test", None));
+    let got = call_with(&app, "POST", &resend_uri(&id(&r)), &admin, None).await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json(), json!({"status": "created"}));
+    assert_eq!(app.email.methods(), vec![ErMethod::Get, ErMethod::Post]);
+    assert_eq!(app.email.created_emails(), vec!["a@example.test"]);
+}
+
+/// 確認済みなら消さない: 409 で DELETE も POST も呼ばない
+#[tokio::test]
+async fn resend_keeps_verified() {
+    let t = tenant().await;
+    let app = app().await;
+    let r = create_recipient_with_email(&app, t, "a", "lw-a", "a@example.test").await;
+    app.email.then_list(
+        200,
+        &list_one("aa11", "A@example.test", Some("2026-01-01T00:00:00Z")),
+    );
+    let got = call_with(
+        &app,
+        "POST",
+        &resend_uri(&id(&r)),
+        &identity(t, Uuid::new_v4()),
+        None,
+    )
+    .await;
+    assert_eq!(got.status, 409);
+    assert_eq!(got.json(), json!({"error": "already_verified"}));
+    assert_eq!(app.email.methods(), vec![ErMethod::Get]);
+    assert!(app.logs().is_empty());
+}
+
+/// 未確認なら、その ID の送り先を DELETE してから POST で作り直す
+#[tokio::test]
+async fn resend_recreates_pending() {
+    let t = tenant().await;
+    let app = app().await;
+    let r = create_recipient_with_email(&app, t, "a", "lw-a", "a@example.test").await;
+    app.email
+        .then_list(200, &list_one("aa11", "a@example.test", None));
+    let got = call_with(
+        &app,
+        "POST",
+        &resend_uri(&id(&r)),
+        &identity(t, Uuid::new_v4()),
+        None,
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json(), json!({"status": "resent"}));
+    assert_eq!(
+        app.email.methods(),
+        vec![ErMethod::Get, ErMethod::Delete, ErMethod::Post]
+    );
+    let calls = app.email.calls();
+    assert_eq!(calls[1].path, "/email/routing/addresses/aa11");
+    assert_eq!(app.email.created_emails(), vec!["a@example.test"]);
+    assert!(app.logs().is_empty());
+
+    // 作り直しの POST が「既に在る」でも成功として扱う
+    app.email
+        .then_list(200, &list_one("aa11", "a@example.test", None));
+    app.email.post_reply(
+        400,
+        r#"{"success":false,"errors":[{"code":1,"message":"Destination address already exists"}]}"#,
+    );
+    let got = call_with(
+        &app,
+        "POST",
+        &resend_uri(&id(&r)),
+        &identity(t, Uuid::new_v4()),
+        None,
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert!(app.logs().is_empty());
+}
+
+/// Cloudflare の失敗は 502 (本文は固定の語)。ログは固定の語と status か label だけ。
+/// 消した後に作るのが失敗したら、送り先が消えたままなので `recreate` の語で見分ける
+#[tokio::test]
+async fn resend_upstream_failures() {
+    let t = tenant().await;
+    let app = app().await;
+    let r =
+        create_recipient_with_email(&app, t, "a", "lw-secret", "secret-addr@example.test").await;
+    let admin = identity(t, Uuid::new_v4());
+    let uri = resend_uri(&id(&r));
+    let upstream = json!({"error": "upstream_error"});
+    let pending = list_one("aa11", "secret-addr@example.test", None);
+
+    // 一覧の失敗 (2xx 以外・届かない)
+    app.email
+        .then_list(500, r#"{"errors":[{"message":"secret upstream text"}]}"#);
+    app.email.then_list_unreachable("fetch");
+    for _ in 0..2 {
+        let got = call_with(&app, "POST", &uri, &admin, None).await;
+        assert_eq!(got.status, 502);
+        assert_eq!(got.json(), upstream);
+    }
+    assert_eq!(app.email.methods(), vec![ErMethod::Get, ErMethod::Get]);
+
+    // 送り先が無いときの作成の失敗
+    app.email.then_list(200, r#"{"result":[]}"#);
+    app.email.post_reply(500, "secret upstream text");
+    let got = call_with(&app, "POST", &uri, &admin, None).await;
+    assert_eq!(got.status, 502);
+    assert_eq!(got.json(), upstream);
+
+    // DELETE の失敗 (2xx 以外・届かない): 作り直しはしない
+    let before = app.email.calls().len();
+    app.email.then_list(200, &pending);
+    app.email.delete_reply(500, "secret upstream text");
+    let got = call_with(&app, "POST", &uri, &admin, None).await;
+    assert_eq!(got.status, 502);
+    assert_eq!(got.json(), upstream);
+    app.email.then_list(200, &pending);
+    app.email.delete_unreachable("fetch");
+    let got = call_with(&app, "POST", &uri, &admin, None).await;
+    assert_eq!(got.status, 502);
+    let methods: Vec<_> = app.email.methods().split_off(before);
+    assert_eq!(
+        methods,
+        vec![
+            ErMethod::Get,
+            ErMethod::Delete,
+            ErMethod::Get,
+            ErMethod::Delete
+        ]
+    );
+
+    // 消した後の作成の失敗 (2xx 以外・届かない)
+    app.email.delete_reply(200, "{}");
+    app.email.then_list(200, &pending);
+    app.email.post_reply(500, "secret upstream text");
+    let got = call_with(&app, "POST", &uri, &admin, None).await;
+    assert_eq!(got.status, 502);
+    app.email.then_list(200, &pending);
+    app.email.post_unreachable("fetch");
+    let got = call_with(&app, "POST", &uri, &admin, None).await;
+    assert_eq!(got.status, 502);
+    assert_eq!(got.json(), upstream);
+
+    assert_eq!(
+        app.logs(),
+        vec![
+            "notify: email routing list failed (status 500)",
+            "notify: email routing list failed (fetch)",
+            "notify: email routing create failed (status 500)",
+            "notify: email routing delete failed (status 500)",
+            "notify: email routing delete failed (fetch)",
+            "notify: email routing recreate failed (status 500)",
+            "notify: email routing recreate failed (fetch)",
+        ]
+    );
 }
