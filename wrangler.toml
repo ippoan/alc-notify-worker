@@ -58,24 +58,21 @@ binding = "INTERNAL_SHARED_SECRET"
 store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
 secret_name = "INTERNAL_SHARED_SECRET"
 
-# 宛先のメールアドレスを Cloudflare Email Routing の送り先として登録する API の token (Email Routing Addresses Edit) と account ID
-# (src/email_routing.rs。宛先の保存と GET /api/notify/recipients/email-status でだけ引く。値は repo に無い)。
+# 宛先のメールアドレスを Cloudflare Email Routing の送り先として登録する API の token (Email Routing Addresses Edit)
+# (src/email_routing.rs。宛先の保存と GET /api/notify/recipients/email-status でだけ引く。値は repo に無い。account ID は [vars])。
 # 無い・読めないときは Cloudflare を呼ばない。binding は env に継承されないので staging にも書く
 [[secrets_store_secrets]]
 binding = "CF_EMAIL_ROUTING_TOKEN"
 store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
 secret_name = "cf-email-routing-token"
 
-[[secrets_store_secrets]]
-binding = "CF_ACCOUNT_ID"
-store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
-secret_name = "cf-account-id"
-
 # 配信のメッセージに載せる viewer のページ・画像の URL と、register-view の宛先 (rust-alc-api の cloudrun/render.sh の
 # NOTIFY_FRONTEND_URL と同じ値)。利用者に配る公開の URL なので平文で書く (ippoan/nuxt-notify の wrangler.jsonc にも在る)。
 # vars は env に継承されないので staging は下で別に書く
 [vars]
 NOTIFY_FRONTEND_URL = "https://notify.ippoan.org"
+# account ID は他の Worker と同じく平文 (ユーザー決定 2026-10-19、Refs ippoan/alc-app#436)。Email Routing の API の宛先 (src/email_routing.rs)
+CF_ACCOUNT_ID = "24b45709d060d957340180e995f0d373"
 
 # staging: DB は ippoan/alc-vein-worker の staging と同じもの (Workers VPC の binding NOTIFY_DB_VPC から
 # 既存の Tunnel 経由で PgBouncer へ繋ぐ。src/db.rs)。Hyperdrive は通さない。
@@ -121,13 +118,10 @@ binding = "CF_EMAIL_ROUTING_TOKEN"
 store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
 secret_name = "cf-email-routing-token"
 
-[[env.staging.secrets_store_secrets]]
-binding = "CF_ACCOUNT_ID"
-store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
-secret_name = "cf-account-id"
-
 [env.staging.vars]
 NOTIFY_FRONTEND_URL = "https://notify-staging.ippoan.org"
+# account ID は他の Worker と同じく平文 (ユーザー決定 2026-10-19、Refs ippoan/alc-app#436)。Email Routing の API の宛先 (src/email_routing.rs)
+CF_ACCOUNT_ID = "24b45709d060d957340180e995f0d373"
 
 # ローカル (`wrangler dev --env local`) 専用。deploy しない。
 # binding を持たない (binding は env に継承されない) ので、src/db.rs は文字列 DATABASE_URL の段で繋ぐ

@@ -7,8 +7,8 @@
 //!
 //! LINE WORKS の API は ippoan/alc-lineworks-worker を Service Binding `ALC_LINEWORKS` で呼ぶ ([`lineworks`])。
 //! 秘密値 `SSO_ENCRYPTION_KEY` (Secrets Store) は line-config の POST と配信の口でだけ、`INTERNAL_SHARED_SECRET`
-//! (Secrets Store、viewer の register-view の認証) は配信の口でだけ引く。`CF_EMAIL_ROUTING_TOKEN`・`CF_ACCOUNT_ID` (Secrets Store、
-//! Cloudflare Email Routing の送り先の登録) は宛先の保存と email-status の口でだけ引く ([`email_routing`])。配信の外への POST (LINE・viewer) は [`http`]。
+//! (Secrets Store、viewer の register-view の認証) は配信の口でだけ引く。`CF_EMAIL_ROUTING_TOKEN` (Secrets Store) と
+//! `CF_ACCOUNT_ID` (`[vars]`) (Cloudflare Email Routing の送り先の登録) は宛先の保存と email-status の口でだけ引く ([`email_routing`])。配信の外への POST (LINE・viewer) は [`http`]。
 
 // worker 本体は wasm32 専用。native の `cargo build` / `clippy` / `test` (workspace の root で打つもの) では空の crate にして、
 // crates/notify だけを検査させる
@@ -51,7 +51,7 @@ const NOTIFY_FRONTEND_URL_VAR: &str = "NOTIFY_FRONTEND_URL";
 
 /// Cloudflare Email Routing の API の token (Secrets Store。権限は Email Routing Addresses Edit)
 const CF_EMAIL_ROUTING_TOKEN_BINDING: &str = "CF_EMAIL_ROUTING_TOKEN";
-/// Cloudflare の account ID (Secrets Store)
+/// Cloudflare の account ID (wrangler.toml の vars。他の Worker と同じく平文)
 const CF_ACCOUNT_ID_BINDING: &str = "CF_ACCOUNT_ID";
 
 /// LINE の channel access token の置き場 (isolate の間ずっと持つ。キーは channel ごと)
@@ -83,14 +83,21 @@ fn lineworks_api(env: &Env) -> Arc<dyn LineworksApi> {
     }
 }
 
-/// 宛先の保存と email-status の口でだけ Secrets Store を引く。どちらかが無い・読めないときは未設定 (Cloudflare は呼ばない)
+/// 宛先の保存と email-status の口でだけ token (Secrets Store) と account ID (vars) を引く。どちらかが無い・空・読めないときは
+/// 未設定 (Cloudflare は呼ばない)
 async fn email_routing_api(env: &Env, needed: bool) -> Arc<dyn EmailRoutingApi> {
     if !needed {
         return Arc::new(NoEmailRouting);
     }
+    let account_id = env
+        .var(CF_ACCOUNT_ID_BINDING)
+        .ok()
+        .map(|v| v.to_string())
+        .filter(|v| !v.is_empty())
+        .map(Arc::from);
     match (
         secret(env, CF_EMAIL_ROUTING_TOKEN_BINDING).await,
-        secret(env, CF_ACCOUNT_ID_BINDING).await,
+        account_id,
     ) {
         (Some(token), Some(account_id)) => Arc::new(CloudflareEmailRouting::new(token, account_id)),
         _ => Arc::new(NoEmailRouting),

@@ -18,7 +18,7 @@ Cloud Run (rust-alc-api) に残っている。** 型は ippoan/alc-lineworks-wor
 宛先の保存 (POST / PUT / bulk) は、メールアドレスが新しく入った・変わったとき、Cloudflare Email Routing の送り先 (destination address) を
 作る (`crates/notify/src/email_routing.rs` の `EmailRoutingApi`、worker の実装は `src/email_routing.rs`)。送れるのは確認済みの送り先だけ
 (後続の alc-measurements の `send_email`)。DB の lock の外で呼ぶ best-effort。**宛先を消しても・変えても送り先は消さない**
-(アカウント全体で共有で、他の tenant も使うため)。token と account ID は Secrets Store の `CF_EMAIL_ROUTING_TOKEN`・`CF_ACCOUNT_ID`。
+(アカウント全体で共有で、他の tenant も使うため)。token は Secrets Store の `CF_EMAIL_ROUTING_TOKEN`、account ID は `[vars]` の `CF_ACCOUNT_ID` (他の Worker と同じく平文)。
 
 LINE WORKS の API はこの worker では叩かず、ippoan/alc-lineworks-worker を Service Binding `ALC_LINEWORKS` で呼ぶ
 (`X-Tenant-ID` 付き。`crates/notify/src/lineworks.rs` の `LineworksApi`、worker の実装は `src/lineworks.rs`)。
@@ -43,8 +43,8 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
 ## 規範
 - 公開範囲を弱めない: 本番・staging とも Service Binding だけ (どの env も `workers_dev`/`preview_urls` = false、route 無し)。
   Hyperdrive (`NOTIFY_HYPERDRIVE`) は本番だけ、staging は VPC (`NOTIFY_DB_VPC`)。`SSO_ENCRYPTION_KEY` (Secrets Store) と
-  `ALC_LINEWORKS` (Service Binding)・`INTERNAL_SHARED_SECRET` (Secrets Store。viewer 登録のヘッダ)・`CF_EMAIL_ROUTING_TOKEN`・`CF_ACCOUNT_ID` (Secrets Store。Email Routing の送り先)・`[vars]`
-  `NOTIFY_FRONTEND_URL` は両方の env に書く (binding も vars も env に継承されない)。`wrangler.toml` の表の順を変えない
+  `ALC_LINEWORKS` (Service Binding)・`INTERNAL_SHARED_SECRET` (Secrets Store。viewer 登録のヘッダ)・`CF_EMAIL_ROUTING_TOKEN` (Secrets Store。Email Routing の送り先)・`[vars]`
+  `NOTIFY_FRONTEND_URL`・`CF_ACCOUNT_ID` は両方の env に書く (binding も vars も env に継承されない)。`wrangler.toml` の表の順を変えない
   (新しい表は placement より後。`[env.staging]` と `[env.staging.observability]` の間に挟まない)。
 - **ログ・エラー応答は固定の語だけ。** `{e}`・DB の message・識別子 (tenant_id・行 id)・入力の値を出さない。
   DB の失敗は `notify: <段> failed: db (<kind>)` (kind は SQLSTATE か tokio-postgres の種類の label)。
@@ -56,5 +56,6 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
   `.github/workflows/ci.yml` の gate) はテストを足したら上げる。
 - public repo: ホスト名・account ID・tenant UUID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
   例外: 利用者に配る公開の viewer URL `NOTIFY_FRONTEND_URL` は wrangler.toml の `[vars]` に平文で置く
-  (rust-alc-api の Cloud Run・ippoan/nuxt-notify と同じ値)。
+  (rust-alc-api の Cloud Run・ippoan/nuxt-notify と同じ値)。Cloudflare の account ID `CF_ACCOUNT_ID` も `[vars]` に平文で置く
+  (auth-worker・nuxt-notify などの Worker と同じ扱い。ユーザー決定 2026-10-19、Refs ippoan/alc-app#436)。
 - kit の rev は直下 `Cargo.toml` の 1 か所 (alc-core-wasm・alc-worker-db・alc-worker-crypto を同じ rev で)。
