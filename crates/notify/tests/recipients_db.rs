@@ -84,6 +84,7 @@ async fn recipient_crud() {
         vec![
             "created_at",
             "email",
+            "employee_id",
             "enabled",
             "id",
             "line_user_id",
@@ -97,6 +98,7 @@ async fn recipient_crud() {
     );
     assert_eq!(yamada["tenant_id"], json!(t.to_string()));
     assert_eq!(yamada["enabled"], json!(true));
+    assert_eq!(yamada["employee_id"], Value::Null);
     assert_eq!(yamada["line_user_id"], Value::Null);
     // chrono の serde と同じ RFC 3339 (UTC は Z)
     let created = yamada["created_at"].as_str().unwrap();
@@ -1660,4 +1662,382 @@ async fn email_provider_non_admin_saves_without_destination() {
     assert_eq!(got.status, 200);
     assert_eq!(got.json()["email"], "n@example.test");
     assert!(app.email.calls().is_empty());
+}
+
+// ---- 宛先と社員マスタの結び付け (migration 184。Refs ippoan/alc-app#436) ----
+// 社員の一覧・PUT での結び付け / 解除・氏名での自動結合。どれも admin だけ。
+
+/// 社員を 1 人作る (superuser で。`code` は社員コード、削除済みにもできる)
+async fn employee(t: Uuid, name: &str, code: Option<&str>, deleted: bool) -> Uuid {
+    let id = Uuid::new_v4();
+    admin()
+        .await
+        .execute(
+            "INSERT INTO alc_api.employees (id, tenant_id, nfc_id, name, code, deleted_at) \
+             VALUES ($1, $2, $3, $4, $5, CASE WHEN $6 THEN NOW() END)",
+            &[&id, &t, &format!("nfc-{id}"), &name, &code, &deleted],
+        )
+        .await
+        .unwrap();
+    id
+}
+
+fn put_as(
+    t: Uuid,
+    role: &str,
+    rid: &str,
+    body: Value,
+) -> (Vec<(&'static str, String)>, String, Value) {
+    (as_role(t, role), format!("{RECIPIENTS}/{rid}"), body)
+}
+
+async fn put_employee(t: Uuid, app: &App, role: &str, rid: &str, body: Value) -> Got {
+    let (h, path, body) = put_as(t, role, rid, body);
+    call_with(app, "PUT", &path, &h, Some(body)).await
+}
+
+/// 社員の一覧は admin だけ。削除済み・別 tenant を除き、社員コードの順 (コードの無い人は後ろ)
+#[tokio::test]
+async fn employees_list() {
+    let t = tenant().await;
+    let other = tenant().await;
+    let app = app().await;
+    let b = employee(t, "乙", Some("20"), false).await;
+    let a = employee(t, "甲", Some("10"), false).await;
+    let none = employee(t, "丙", None, false).await;
+    employee(t, "削除", Some("00"), true).await;
+    employee(other, "他社", Some("01"), false).await;
+
+    let got = call_with(
+        &app,
+        "GET",
+        "/api/notify/employees",
+        &as_role(t, "user"),
+        None,
+    )
+    .await;
+    assert_eq!((got.status, error_of(&got)), (403, json!("forbidden")));
+    let got = call(&app, "GET", "/api/notify/employees", Some(t), None).await;
+    assert_eq!(got.status, 403);
+
+    let got = call_with(
+        &app,
+        "GET",
+        "/api/notify/employees",
+        &as_role(t, "admin"),
+        None,
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    let list = got.json();
+    assert_eq!(
+        list,
+        json!([
+            {"id": a, "name": "甲", "code": "10"},
+            {"id": b, "name": "乙", "code": "20"},
+            {"id": none, "name": "丙", "code": null},
+        ])
+    );
+    assert!(app.logs.lock().unwrap().is_empty());
+}
+
+/// PUT の employee_id: UUID で結び付け・null で外す・送らなければ変えない。admin だけ。
+/// 他の宛先に結び付いた社員は 409、この tenant に無い・削除済みの社員は 400。社員を消したら結び付けだけ外れる
+#[tokio::test]
+async fn recipient_put_links_employee() {
+    let t = tenant().await;
+    let other = tenant().await;
+    let app = app().await;
+    let r1 = id(&create_recipient(&app, t, "一", "lw-1").await);
+    let r2 = id(&create_recipient(&app, t, "二", "lw-2").await);
+    let emp = employee(t, "社員", Some("1"), false).await;
+    let gone = employee(t, "退職", None, true).await;
+    let foreign = employee(other, "他社", None, false).await;
+
+    // admin でなければ 403 (null でも)。何も変わらない
+    for body in [json!({"employee_id": emp}), json!({"employee_id": null})] {
+        let got = put_employee(t, &app, "user", &r1, body).await;
+        assert_eq!((got.status, error_of(&got)), (403, json!("forbidden")));
+    }
+    // 結び付ける
+    let got = put_employee(t, &app, "admin", &r1, json!({"employee_id": emp})).await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json()["employee_id"], json!(emp));
+    // 一覧・1 件の応答にも載る
+    let got = call(&app, "GET", &format!("{RECIPIENTS}/{r1}"), Some(t), None).await;
+    assert_eq!(got.json()["employee_id"], json!(emp));
+    let listed = call(&app, "GET", RECIPIENTS, Some(t), None).await.json();
+    assert_eq!(listed[0]["employee_id"], json!(emp));
+    assert_eq!(listed[1]["employee_id"], Value::Null);
+    // 送らなければ変えない (admin でなくてもほかの項目は直せる)
+    let got = call(
+        &app,
+        "PUT",
+        &format!("{RECIPIENTS}/{r1}"),
+        Some(t),
+        Some(json!({"name": "一 改"})),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json()["employee_id"], json!(emp));
+    // 同じ社員を別の宛先へは 409。その宛先は結び付かないまま、接続はそのまま使える
+    let got = put_employee(t, &app, "admin", &r2, json!({"employee_id": emp})).await;
+    assert_eq!(
+        (got.status, error_of(&got)),
+        (409, json!("employee_already_linked"))
+    );
+    let got = call(&app, "GET", &format!("{RECIPIENTS}/{r2}"), Some(t), None).await;
+    assert_eq!(got.json()["employee_id"], Value::Null);
+    // 同じ宛先に同じ社員を入れ直すのは通る
+    let got = put_employee(t, &app, "admin", &r1, json!({"employee_id": emp})).await;
+    assert_eq!(got.status, 200);
+    // 無い社員・削除済み・別 tenant の社員は 400
+    for bad in [Uuid::new_v4(), gone, foreign] {
+        let got = put_employee(t, &app, "admin", &r2, json!({"employee_id": bad})).await;
+        assert_eq!(
+            (got.status, error_of(&got)),
+            (400, json!("employee_not_found"))
+        );
+    }
+    // 外す → 別の宛先に付けられる
+    let got = put_employee(t, &app, "admin", &r1, json!({"employee_id": null})).await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json()["employee_id"], Value::Null);
+    let got = put_employee(t, &app, "admin", &r2, json!({"employee_id": emp})).await;
+    assert_eq!(got.status, 200);
+    // 社員を消すと結び付けだけが外れる (宛先は残る)
+    admin()
+        .await
+        .execute("DELETE FROM alc_api.employees WHERE id = $1", &[&emp])
+        .await
+        .unwrap();
+    let got = call(&app, "GET", &format!("{RECIPIENTS}/{r2}"), Some(t), None).await;
+    assert_eq!(
+        (got.status, got.json()["employee_id"].clone()),
+        (200, Value::Null)
+    );
+    assert!(app.logs.lock().unwrap().is_empty());
+}
+
+fn link_body(dry_run: bool) -> Value {
+    json!({"dry_run": dry_run})
+}
+
+fn link_uri() -> &'static str {
+    "/api/notify/recipients/link-employees-by-name"
+}
+
+/// `skipped` を (宛先の名前, 理由) の列にする (名前の順)
+fn skipped_of(v: &Value) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = v["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| {
+            (
+                s["recipient_name"].as_str().unwrap().to_owned(),
+                s["reason"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// 氏名での自動結合: dry_run (既定) は書かず、確定で書く。空白 (半角・全角) を除いて比べ、
+/// 一致する社員がちょうど 1 人・宛先も社員も未結合のものだけを結ぶ
+#[tokio::test]
+async fn link_employees_by_name_rules() {
+    let t = tenant().await;
+    let other = tenant().await;
+    let app = app().await;
+    let admin_h = as_role(t, "admin");
+    let post = |body: Option<Value>| {
+        let (app, h) = (&app, &admin_h);
+        async move { call_with(app, "POST", link_uri(), h, body).await }
+    };
+
+    // 宛先 (lw の ID は一意)
+    let yamada = id(&create_recipient(&app, t, "山田 太郎", "lw-1").await);
+    let hanako = id(&create_recipient(&app, t, "山田\u{3000}花子", "lw-2").await);
+    create_recipient(&app, t, "高橋", "lw-3").await; // 社員がいない
+    create_recipient(&app, t, "鈴木 一", "lw-4").await; // 同名の社員が 2 人
+    create_recipient(&app, t, "田中 三郎", "lw-5").await; // 同名の宛先が 2 つ
+    create_recipient(&app, t, "田中三郎", "lw-6").await;
+    let ito = id(&create_recipient(&app, t, "伊藤 四郎", "lw-7").await); // 既に結び付いている
+    create_recipient(&app, t, "渡辺 五郎", "lw-8").await; // 社員は他の宛先に結び付いている
+    let taken = id(&create_recipient(&app, t, "別の呼び名", "lw-9").await);
+    create_recipient(&app, t, "  \u{3000} ", "lw-10").await; // 空白だけ
+    create_recipient(&app, t, "退職 者", "lw-11").await; // 社員は削除済み
+    create_recipient(&app, t, "他社 人", "lw-12").await; // 同名の社員は別 tenant
+    let kobayashi = id(&create_recipient(&app, t, "小林 六郎", "lw-13").await);
+
+    // 社員
+    let e_yamada = employee(t, "山田太郎", Some("1"), false).await;
+    let e_hanako = employee(t, "山田 花子", Some("2"), false).await;
+    employee(t, "鈴木一", None, false).await;
+    employee(t, "鈴木 一", None, false).await;
+    employee(t, "田中三郎", None, false).await;
+    let e_ito = employee(t, "伊藤四郎", None, false).await;
+    let e_watanabe = employee(t, "渡辺五郎", None, false).await;
+    employee(t, "", None, false).await; // 名前が空の社員とも合わせない
+    employee(t, "退職者", None, true).await;
+    employee(other, "他社人", None, false).await;
+    let e_kobayashi = employee(t, "小林六郎", Some("9"), false).await;
+    for (r, e) in [(&ito, e_ito), (&taken, e_watanabe)] {
+        let got = put_employee(t, &app, "admin", r, json!({"employee_id": e})).await;
+        assert_eq!(got.status, 200);
+    }
+
+    let expected_skipped = vec![
+        ("他社 人".to_owned(), "no_match".to_owned()),
+        ("伊藤 四郎".to_owned(), "already_linked".to_owned()),
+        ("別の呼び名".to_owned(), "already_linked".to_owned()),
+        ("退職 者".to_owned(), "no_match".to_owned()),
+        ("高橋".to_owned(), "no_match".to_owned()),
+        ("渡辺 五郎".to_owned(), "employee_already_linked".to_owned()),
+        ("鈴木 一".to_owned(), "multiple_employees".to_owned()),
+        ("  \u{3000} ".to_owned(), "no_match".to_owned()),
+        ("田中 三郎".to_owned(), "multiple_recipients".to_owned()),
+        ("田中三郎".to_owned(), "multiple_recipients".to_owned()),
+    ];
+    let mut expected_skipped = expected_skipped;
+    expected_skipped.sort();
+
+    // dry_run: 本文なし・{}・true のどれも既定は書かない
+    for body in [None, Some(json!({})), Some(link_body(true))] {
+        let got = post(body).await;
+        assert_eq!(got.status, 200);
+        let v = got.json();
+        assert_eq!(v["dry_run"], json!(true));
+        assert_eq!(v["linked"], json!(0));
+        let mut cands = v["candidates"].as_array().unwrap().clone();
+        cands.sort_by_key(|c| c["recipient_id"].as_str().unwrap().to_owned());
+        let mut expect = vec![
+            json!({
+                "recipient_id": yamada, "recipient_name": "山田 太郎",
+                "employee_id": e_yamada, "employee_name": "山田太郎", "employee_code": "1"
+            }),
+            json!({
+                "recipient_id": hanako, "recipient_name": "山田\u{3000}花子",
+                "employee_id": e_hanako, "employee_name": "山田 花子", "employee_code": "2"
+            }),
+            json!({
+                "recipient_id": kobayashi, "recipient_name": "小林 六郎",
+                "employee_id": e_kobayashi, "employee_name": "小林六郎", "employee_code": "9"
+            }),
+        ];
+        expect.sort_by_key(|c| c["recipient_id"].as_str().unwrap().to_owned());
+        assert_eq!(cands, expect);
+        assert_eq!(skipped_of(&v), expected_skipped);
+    }
+    let listed = call(&app, "GET", RECIPIENTS, Some(t), None).await.json();
+    assert_eq!(
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| !r["employee_id"].is_null())
+            .count(),
+        2,
+        "dry_run は何も書かない"
+    );
+
+    // 確定
+    let got = post(Some(link_body(false))).await;
+    assert_eq!(got.status, 200);
+    let v = got.json();
+    assert_eq!(
+        (v["dry_run"].clone(), v["linked"].clone()),
+        (json!(false), json!(3))
+    );
+    assert_eq!(v["candidates"].as_array().unwrap().len(), 3);
+    let by_name = |listed: &Value, name: &str| -> Value {
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["name"] == name)
+            .unwrap()["employee_id"]
+            .clone()
+    };
+    let listed = call(&app, "GET", RECIPIENTS, Some(t), None).await.json();
+    assert_eq!(by_name(&listed, "山田 太郎"), json!(e_yamada));
+    assert_eq!(by_name(&listed, "山田\u{3000}花子"), json!(e_hanako));
+    assert_eq!(by_name(&listed, "小林 六郎"), json!(e_kobayashi));
+    assert_eq!(by_name(&listed, "高橋"), Value::Null);
+    assert_eq!(by_name(&listed, "田中 三郎"), Value::Null);
+
+    // 2 回目は結ぶものが無い (結んだ宛先は already_linked)
+    let got = post(Some(link_body(false))).await;
+    let v = got.json();
+    assert_eq!(
+        (v["linked"].clone(), v["candidates"].clone()),
+        (json!(0), json!([]))
+    );
+    assert_eq!(
+        v["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| s["reason"] == "already_linked")
+            .count(),
+        5
+    );
+
+    // admin でなければ 403
+    let got = call_with(
+        &app,
+        "POST",
+        link_uri(),
+        &as_role(t, "user"),
+        Some(link_body(false)),
+    )
+    .await;
+    assert_eq!((got.status, error_of(&got)), (403, json!("forbidden")));
+    let got = call(&app, "POST", link_uri(), Some(t), None).await;
+    assert_eq!(got.status, 403);
+    assert!(app.logs.lock().unwrap().is_empty());
+}
+
+/// 新しい口の DB の失敗は 500 (本文なし・固定のログ)
+#[tokio::test]
+async fn employee_routes_db_failure_is_500() {
+    let t = tenant().await;
+    let app = broken_app().await;
+    let h = as_role(t, "admin");
+    let r = Uuid::new_v4();
+    let cases: Vec<(&str, String, Option<Value>, &str)> = vec![
+        (
+            "GET",
+            "/api/notify/employees".into(),
+            None,
+            "list employees",
+        ),
+        (
+            "POST",
+            link_uri().into(),
+            Some(link_body(false)),
+            "link employees by name",
+        ),
+        (
+            "PUT",
+            format!("{RECIPIENTS}/{r}"),
+            Some(json!({"employee_id": Uuid::new_v4()})),
+            "update recipient",
+        ),
+    ];
+    for (method, path, body, what) in cases {
+        app.logs.lock().unwrap().clear();
+        let got = call_with(&app, method, &path, &h, body).await;
+        assert_eq!((got.status, got.body.len()), (500, 0), "{method} {path}");
+        let logs = app.logs.lock().unwrap().clone();
+        assert_eq!(logs.len(), 1, "{method} {path}");
+        assert!(
+            logs[0].starts_with(&format!("notify: {what} failed: db (")),
+            "{}",
+            logs[0]
+        );
+        assert!(!logs[0].contains(&t.to_string()));
+    }
 }
