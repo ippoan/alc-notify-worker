@@ -15,7 +15,7 @@
 //! path・method・JSON の形・status は rust と同じ (nuxt-notify と auth-worker がそのまま使う)。path の頭の `/api` は、
 //! auth-worker の Service Binding が渡す path (`/api/...` のまま) に合わせる。
 //! tenant は auth-worker が付ける `X-Tenant-ID` (無い・UUID でない → 401。`alc_core_wasm::require_tenant_header`)。
-//! role の検査は rust にも無いので持たない (例外: 宛先の保存で Cloudflare の送り先を作るのは `admin` のときだけ。[`email_routing`])。
+//! role の検査は rust にも無いので持たない (例外: 社員との結び付けの口は admin だけ。宛先の保存で Cloudflare の送り先を作るのは `admin` のときだけ。[`email_routing`])。
 //!
 //! 失敗の応答は rust と同じ (宛先・グループ・line-config は本文なしの status、LINE WORKS の口は `{"error": ...}`)。ログは固定の語と DB のエラーの kind だけ (識別子・入力の値を出さない)。
 

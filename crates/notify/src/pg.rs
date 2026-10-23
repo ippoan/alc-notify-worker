@@ -21,7 +21,7 @@ pub mod sql {
     /// notify_recipients の列 (rust の `NotifyRecipient` の並び)
     macro_rules! recipient_cols {
         () => {
-            "id, tenant_id, name, provider, lineworks_user_id, line_user_id, phone_number, email, enabled, created_at, updated_at"
+            "id, tenant_id, name, provider, lineworks_user_id, line_user_id, phone_number, email, enabled, created_at, updated_at, employee_id"
         };
     }
     /// notify_groups の列 (rust の `NotifyGroup` の並び)
@@ -49,7 +49,8 @@ pub mod sql {
         recipient_cols!()
     );
 
-    /// 指定の無い項目は元のまま (rust と同じ COALESCE。null で消す口は無い)
+    /// 指定の無い項目は元のまま (rust と同じ COALESCE。null で消す口は無い)。
+    /// 例外は employee_id: `$10` (送ってきたか) が真のときだけ `$11` で置く (`$11` が NULL なら結び付けを外す)
     pub const UPDATE_RECIPIENT: &str = concat!(
         "UPDATE notify_recipients SET \
          name = COALESCE($1, name), \
@@ -59,10 +60,24 @@ pub mod sql {
          phone_number = COALESCE($5, phone_number), \
          email = COALESCE($6, email), \
          enabled = COALESCE($7, enabled), \
+         employee_id = CASE WHEN $10 THEN $11 ELSE employee_id END, \
          updated_at = NOW() \
          WHERE tenant_id = $8 AND id = $9 RETURNING ",
         recipient_cols!()
     );
+
+    /// 社員マスタの選択肢 (削除済みを除く。社員コードの順、コードの無い人は後ろ)
+    pub const LIST_EMPLOYEES: &str = "SELECT id, name, code FROM employees \
+         WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY code NULLS LAST, name, id";
+
+    /// 結び付けてよい社員 (この tenant の、削除されていない社員) か。FK は RLS を通らないので別 tenant の id も通ってしまうため先に確かめる
+    pub const EMPLOYEE_EXISTS: &str =
+        "SELECT 1 FROM employees WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL";
+
+    /// 氏名での自動結合が書く 1 件。結び付いていない宛先にだけ書く
+    pub const LINK_EMPLOYEE: &str =
+        "UPDATE notify_recipients SET employee_id = $1, updated_at = NOW() \
+         WHERE tenant_id = $2 AND id = $3 AND employee_id IS NULL";
 
     pub const DELETE_RECIPIENT: &str =
         "DELETE FROM notify_recipients WHERE tenant_id = $1 AND id = $2";
@@ -111,7 +126,7 @@ pub mod sql {
 
     pub const LIST_MEMBERS: &str =
         "SELECT r.id, r.tenant_id, r.name, r.provider, r.lineworks_user_id, r.line_user_id, \
-         r.phone_number, r.email, r.enabled, r.created_at, r.updated_at \
+         r.phone_number, r.email, r.enabled, r.created_at, r.updated_at, r.employee_id \
          FROM notify_recipients r \
          JOIN notify_recipient_groups rg ON rg.recipient_id = r.id \
          WHERE rg.group_id = $1 AND r.tenant_id = $2 \
@@ -187,7 +202,7 @@ pub mod sql {
 
     pub const LIST_ENABLED_MEMBERS: &str =
         "SELECT r.id, r.tenant_id, r.name, r.provider, r.lineworks_user_id, r.line_user_id, \
-         r.phone_number, r.email, r.enabled, r.created_at, r.updated_at \
+         r.phone_number, r.email, r.enabled, r.created_at, r.updated_at, r.employee_id \
          FROM notify_recipients r \
          JOIN notify_recipient_groups rg ON rg.recipient_id = r.id \
          WHERE rg.group_id = $1 AND r.tenant_id = $2 AND r.enabled = TRUE \
@@ -238,6 +253,8 @@ pub struct NotifyRecipient {
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// 社員マスタのどの社員か (結び付けていなければ null。migration 184)
+    pub employee_id: Option<Uuid>,
 }
 
 impl TxOutput for NotifyRecipient {}
@@ -261,6 +278,18 @@ pub struct UpdateNotifyRecipient {
     pub phone_number: Option<String>,
     pub email: Option<String>,
     pub enabled: Option<bool>,
+    /// 送らなければ変えない (`None`)・`null` で結び付けを外す (`Some(None)`)・UUID で結び付ける (`Some(Some(id))`)
+    #[serde(default, deserialize_with = "present_or_null")]
+    pub employee_id: Option<Option<Uuid>>,
+}
+
+/// 項目が在る (`null` を含む) ことを `Some` で見分ける (`Option<Option<T>>` の既定の読みは `null` と無しを区別しない)
+fn present_or_null<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
 }
 
 /// rust の `alc_core::repository::notify_groups::NotifyGroup` と同じ JSON
@@ -433,6 +462,7 @@ fn recipient(r: &Row) -> NotifyRecipient {
         enabled: r.get(8),
         created_at: r.get(9),
         updated_at: r.get(10),
+        employee_id: r.get(11),
     }
 }
 
@@ -530,10 +560,175 @@ pub async fn update_recipient(
                         (&input.enabled, Type::BOOL),
                         (&tenant_id, Type::UUID),
                         (&id, Type::UUID),
+                        (&input.employee_id.is_some(), Type::BOOL),
+                        (&input.employee_id.flatten(), Type::UUID),
                     ],
                 )
                 .await?;
             Ok(recipient(&row))
+        })
+    })
+    .await
+}
+
+/// 社員マスタの 1 行 (宛先の画面の選択肢)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Employee {
+    pub id: Uuid,
+    pub name: String,
+    pub code: Option<String>,
+}
+
+impl TxOutput for Employee {}
+
+pub async fn list_employees(pg: &mut PgClient, tenant_id: Uuid) -> Result<Vec<Employee>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(sql::LIST_EMPLOYEES, &[(&tenant_id, Type::UUID)])
+                .await?;
+            Ok(rows.iter().map(employee).collect())
+        })
+    })
+    .await
+}
+
+fn employee(r: &Row) -> Employee {
+    Employee {
+        id: r.get(0),
+        name: r.get(1),
+        code: r.get(2),
+    }
+}
+
+/// この tenant の、削除されていない社員か
+pub async fn employee_exists(pg: &mut PgClient, tenant_id: Uuid, id: Uuid) -> Result<bool, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let row = tx
+                .query_typed_opt(
+                    sql::EMPLOYEE_EXISTS,
+                    &[(&tenant_id, Type::UUID), (&id, Type::UUID)],
+                )
+                .await?;
+            Ok(row.is_some())
+        })
+    })
+    .await
+}
+
+/// 氏名の比べ方: 空白 (半角・全角を含む `char::is_whitespace`) を全部除く
+pub fn name_key(name: &str) -> String {
+    name.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// 自動結合の候補 (宛先 ↔ 社員)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LinkCandidate {
+    pub recipient_id: Uuid,
+    pub recipient_name: String,
+    pub employee_id: Uuid,
+    pub employee_name: String,
+    pub employee_code: Option<String>,
+}
+
+/// 結ばなかった宛先とその理由。`reason` は固定の語:
+/// `already_linked` (その宛先は既に社員に結び付いている)・`no_match` (一致する社員がいない・名前が空)・
+/// `multiple_employees` (同じ名前の社員が 2 人以上)・`employee_already_linked` (その社員は既に他の宛先に結び付いている)・
+/// `multiple_recipients` (同じ名前の宛先が 2 つ以上で、同じ社員を取り合う)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LinkSkipped {
+    pub recipient_id: Uuid,
+    pub recipient_name: String,
+    pub reason: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LinkPlan {
+    pub candidates: Vec<LinkCandidate>,
+    pub skipped: Vec<LinkSkipped>,
+}
+
+impl TxOutput for LinkPlan {}
+
+/// 規則: 宛先の名前と社員の名前を [`name_key`] で比べ、一致する社員がちょうど 1 人で、その宛先がまだ結び付いておらず、
+/// その社員もまだ他の宛先に結び付いていないものだけを結ぶ。同じ名前の未結合の宛先が 2 つ以上ある組は、どちらも結ばない
+/// (同じ社員を取り合い、部分 UNIQUE に当たるため)
+pub fn plan_links(recipients: &[NotifyRecipient], employees: &[Employee]) -> LinkPlan {
+    let linked: std::collections::HashSet<Uuid> =
+        recipients.iter().filter_map(|r| r.employee_id).collect();
+    let mut unlinked_per_key: std::collections::HashMap<String, usize> = Default::default();
+    for r in recipients.iter().filter(|r| r.employee_id.is_none()) {
+        *unlinked_per_key.entry(name_key(&r.name)).or_default() += 1;
+    }
+    let mut plan = LinkPlan {
+        candidates: Vec::new(),
+        skipped: Vec::new(),
+    };
+    for r in recipients {
+        let skip = |reason| LinkSkipped {
+            recipient_id: r.id,
+            recipient_name: r.name.clone(),
+            reason,
+        };
+        if r.employee_id.is_some() {
+            plan.skipped.push(skip("already_linked"));
+            continue;
+        }
+        let key = name_key(&r.name);
+        let matches: Vec<&Employee> = employees
+            .iter()
+            .filter(|e| !key.is_empty() && name_key(&e.name) == key)
+            .collect();
+        match matches.as_slice() {
+            [] => plan.skipped.push(skip("no_match")),
+            [e] if linked.contains(&e.id) => plan.skipped.push(skip("employee_already_linked")),
+            [_] if unlinked_per_key[&key] > 1 => plan.skipped.push(skip("multiple_recipients")),
+            [e] => plan.candidates.push(LinkCandidate {
+                recipient_id: r.id,
+                recipient_name: r.name.clone(),
+                employee_id: e.id,
+                employee_name: e.name.clone(),
+                employee_code: e.code.clone(),
+            }),
+            _ => plan.skipped.push(skip("multiple_employees")),
+        }
+    }
+    plan
+}
+
+/// 氏名での自動結合。宛先と社員を読んで [`plan_links`] で候補を決め、`dry_run` でなければ同じ transaction で結ぶ
+/// (途中で部分 UNIQUE に当たったら全部やめる = `Err`)
+pub async fn link_employees_by_name(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    dry_run: bool,
+) -> Result<LinkPlan, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(sql::LIST_RECIPIENTS, &[(&tenant_id, Type::UUID)])
+                .await?;
+            let recipients: Vec<NotifyRecipient> = rows.iter().map(recipient).collect();
+            let rows = tx
+                .query_typed(sql::LIST_EMPLOYEES, &[(&tenant_id, Type::UUID)])
+                .await?;
+            let employees: Vec<Employee> = rows.iter().map(employee).collect();
+            let plan = plan_links(&recipients, &employees);
+            if !dry_run {
+                for c in &plan.candidates {
+                    tx.execute_typed(
+                        sql::LINK_EMPLOYEE,
+                        &[
+                            (&c.employee_id, Type::UUID),
+                            (&tenant_id, Type::UUID),
+                            (&c.recipient_id, Type::UUID),
+                        ],
+                    )
+                    .await?;
+                }
+            }
+            Ok(plan)
         })
     })
     .await

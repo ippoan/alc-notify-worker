@@ -9,7 +9,13 @@
 //! | PUT | `/api/notify/recipients/{id}` | 200 直した行 (無ければ 500。rust と同じ。既存の行と合成して POST と同じ 400 の検査) |
 //! | DELETE | `/api/notify/recipients/{id}` | 204 (無くても 204) |
 //! | POST | `/api/notify/recipients/{id}/resend-verification` | 200 `{"status":"created"|"resent"}` / 409 `already_verified` (本文なし。admin だけ。rust に無い口。[`crate::email_routing`]) |
+//! | GET | `/api/notify/employees` | 200 `[{id, name, code}]` (社員マスタ。削除済みを除く。社員コードの順。admin だけ。宛先の画面の選択肢。rust に無い口) |
+//! | POST | `/api/notify/recipients/link-employees-by-name` | 200 `{dry_run, candidates, skipped, linked}` (admin だけ。rust に無い口。[`link_employees_by_name`]) |
 //! | GET | `/api/notify/recipients/email-status` | 200 `{configured, items: [{recipient_id, email_status}]}` (rust に無い口。[`crate::email_routing`]) |
+//!
+//! 宛先の応答には `employee_id` (社員マスタの社員。結び付けていなければ null。migration 184) が載る。PUT で `employee_id` を
+//! UUID にすれば結び付け、`null` なら外し、送らなければ変えない (admin だけ。他の宛先に結び付いた社員は 409 `employee_already_linked`、
+//! この tenant に無い・削除済みの社員は 400 `employee_not_found`)。
 //!
 //! POST / PUT / bulk で、メールアドレスが新しく入った・変わったときは、保存の後に Cloudflare Email Routing の送り先を作る
 //! (best-effort。DB の lock の外。`X-User-Role` が `admin` のときだけ。送り先は宛先を消しても・変えても消さない)。
@@ -35,6 +41,8 @@ pub const RECIPIENTS_PATH: &str = "/api/notify/recipients";
 pub const RECIPIENTS_BULK_PATH: &str = "/api/notify/recipients/bulk";
 pub const RECIPIENT_PATH: &str = "/api/notify/recipients/{id}";
 pub const EMAIL_STATUS_PATH: &str = "/api/notify/recipients/email-status";
+pub const EMPLOYEES_PATH: &str = "/api/notify/employees";
+pub const LINK_EMPLOYEES_PATH: &str = "/api/notify/recipients/link-employees-by-name";
 pub const RESEND_VERIFICATION_PATH: &str = "/api/notify/recipients/{id}/resend-verification";
 
 /// 送り先を作ってよい呼び手か (auth-worker が付ける `X-User-Role`。任意のアドレスに Cloudflare の確認メールが飛ぶため)
@@ -49,6 +57,8 @@ pub fn router() -> Router<NotifyState> {
         .route(RECIPIENTS_PATH, get(list).post(create))
         .route(RECIPIENTS_BULK_PATH, post(bulk_upsert))
         .route(EMAIL_STATUS_PATH, get(email_status))
+        .route(EMPLOYEES_PATH, get(list_employees))
+        .route(LINK_EMPLOYEES_PATH, post(link_employees_by_name))
         .route(RESEND_VERIFICATION_PATH, post(resend_verification))
         .route(RECIPIENT_PATH, get(get_one).put(update).delete(delete))
 }
@@ -105,6 +115,7 @@ async fn bulk_upsert(
                     phone_number: r.phone_number,
                     email: r.email,
                     enabled: None,
+                    employee_id: None,
                 };
                 pg::update_recipient(&mut pg, tenant.0, id, input).await
             }
@@ -232,11 +243,23 @@ async fn update(
     Json(input): Json<UpdateNotifyRecipient>,
 ) -> Result<Json<Value>, Response> {
     let admin = is_admin(&auth_user);
+    // 社員との結び付けは、誰の測定結果が誰に届くかを決めるので admin だけ
+    if input.employee_id.is_some() && !admin {
+        return Err(forbidden());
+    }
     // メールアドレスを送ってきたときだけ、保存前のメールアドレスを比べる (送らなければ COALESCE で変わらない)
     let check_email = admin && input.email.is_some();
-    let fail = |e: &_| state.db_fail("update recipient", e).into_response();
+    let fail = |e: &_| link_fail(&state, "update recipient", e);
     let recipient = {
         let mut pg = state.pg.lock().await;
+        if let Some(Some(employee_id)) = input.employee_id {
+            if !pg::employee_exists(&mut pg, tenant.0, employee_id)
+                .await
+                .map_err(|e| fail(&e))?
+            {
+                return Err(bad_request("employee_not_found"));
+            }
+        }
         // 既存の行を読み、入力 (送らなかった項目は既存の値のまま = COALESCE) と合成してから検査する。
         // 行が無ければ検査せず、update が従来どおり失敗する
         let existing = pg::get_recipient(&mut pg, tenant.0, id)
@@ -268,6 +291,86 @@ async fn update(
         state.ensure_destination(&email).await;
     }
     Ok(Json(json!(recipient)))
+}
+
+/// 403 `{"error":"forbidden"}`
+fn forbidden() -> Response {
+    (StatusCode::FORBIDDEN, Json(json!({ "error": "forbidden" }))).into_response()
+}
+
+/// 社員の部分 UNIQUE (migration 184) に当たった失敗か (その社員は既に他の宛先に結び付いている)
+fn is_employee_conflict(e: &tokio_postgres::Error) -> bool {
+    e.as_db_error()
+        .is_some_and(|d| d.constraint() == Some("idx_notify_recipients_employee"))
+}
+
+/// 結び付けの書き込みの失敗: 部分 UNIQUE なら 409 `employee_already_linked`、それ以外は DB の失敗の 500 (本文なし)
+fn link_fail(state: &NotifyState, what: &str, e: &tokio_postgres::Error) -> Response {
+    if is_employee_conflict(e) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "employee_already_linked" })),
+        )
+            .into_response();
+    }
+    state.db_fail(what, e).into_response()
+}
+
+/// 社員マスタ (宛先の画面の選択肢)。admin だけ
+async fn list_employees(
+    State(state): State<NotifyState>,
+    Extension(tenant): Extension<TenantId>,
+    auth_user: Option<Extension<AuthUser>>,
+) -> Result<Json<Value>, Response> {
+    if !is_admin(&auth_user) {
+        return Err(forbidden());
+    }
+    let mut pg = state.pg.lock().await;
+    let employees = pg::list_employees(&mut pg, tenant.0)
+        .await
+        .map_err(|e| state.db_fail("list employees", &e).into_response())?;
+    Ok(Json(json!(employees)))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct LinkEmployeesInput {
+    /// 既定は `true` (候補を返すだけで何も書かない)。`false` で確定して書く
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// 宛先の名前と社員の名前を、空白 (半角・全角) を全部除いて比べ、一致する社員がちょうど 1 人で、その宛先がまだ結び付いておらず、
+/// その社員もまだ他の宛先に結び付いていないものだけを結ぶ。admin だけ。
+/// 応答は `{dry_run, candidates: [{recipient_id, recipient_name, employee_id, employee_name, employee_code}], skipped: [{recipient_id, recipient_name, reason}], linked}`。
+/// `dry_run` (既定) は `candidates` を返すだけで `linked` は 0。`false` なら `candidates` を 1 つの transaction で書き、`linked` はその数。
+/// `reason` は `already_linked`・`no_match`・`multiple_employees`・`employee_already_linked`・`multiple_recipients` ([`pg::LinkSkipped`])。
+/// 確定の途中で他の呼び出しに先を越され部分 UNIQUE に当たったら、何も書かず 409 `employee_already_linked`
+async fn link_employees_by_name(
+    State(state): State<NotifyState>,
+    Extension(tenant): Extension<TenantId>,
+    auth_user: Option<Extension<AuthUser>>,
+    body: Option<Json<LinkEmployeesInput>>,
+) -> Result<Json<Value>, Response> {
+    if !is_admin(&auth_user) {
+        return Err(forbidden());
+    }
+    let dry_run = body.is_none_or(|Json(b)| b.dry_run);
+    let plan = {
+        let mut pg = state.pg.lock().await;
+        pg::link_employees_by_name(&mut pg, tenant.0, dry_run).await
+    }
+    .map_err(|e| link_fail(&state, "link employees by name", &e))?;
+    let linked = if dry_run { 0 } else { plan.candidates.len() };
+    Ok(Json(json!({
+        "dry_run": dry_run,
+        "candidates": plan.candidates,
+        "skipped": plan.skipped,
+        "linked": linked,
+    })))
 }
 
 async fn delete(
