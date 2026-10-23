@@ -13,7 +13,7 @@ Cloud Run (rust-alc-api) に残っている。** 型は ippoan/alc-lineworks-wor
   provider ごとの必須が空なら 400 `line_user_id_required` / `lineworks_user_id_required` / `email_required`。rust に無い検査)・`/bulk` (POST)・`/{id}` (GET / PUT / DELETE)・`/email-status` (GET。rust に無い口。
   宛先のメールアドレスの Cloudflare Email Routing の送り先としての状態 `verified` / `pending` / `not_registered`。未設定なら `{configured:false}`)
   **Cloudflare の送り先一覧 (`GET .../email/routing/addresses`) の応答の `result_info` は `total_pages` を持たない (資料と違う)。ページ数は `total_count` を 50 で割って数える。**
-- `/api/notify/employees` (GET。rust に無い口。社員マスタの `[{id, name, code}]`。削除済みを除く・社員コードの順。admin だけ。宛先の画面の選択肢)
+- `/api/notify/employees` (GET。rust に無い口。社員マスタの `[{id, name, code, role}]` (role = 役割の配列 `driver`/`manager`/`admin`。血圧の日報を受け取れるのは manager・admin)。削除済みを除く・社員コードの順。admin だけ。宛先の画面の選択肢)
 - 宛先の応答は `employee_id` (社員マスタの社員。null か UUID。migration 184) を持つ。PUT で `employee_id` を UUID にすれば結び付け・`null` で解除・送らなければ変えない
   (admin だけ。他の宛先に結び付いた社員は 409 `employee_already_linked`、この tenant に無い・削除済みは 400 `employee_not_found`)。
   `/api/notify/recipients/link-employees-by-name` (POST。body `{"dry_run": bool}`、既定 true。admin だけ。応答 `{dry_run, candidates, skipped, linked}`。

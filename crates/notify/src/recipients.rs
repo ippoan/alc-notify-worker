@@ -9,7 +9,7 @@
 //! | PUT | `/api/notify/recipients/{id}` | 200 直した行 (無ければ 500。rust と同じ。既存の行と合成して POST と同じ 400 の検査) |
 //! | DELETE | `/api/notify/recipients/{id}` | 204 (無くても 204) |
 //! | POST | `/api/notify/recipients/{id}/resend-verification` | 200 `{"status":"created"|"resent"}` / 409 `already_verified` (本文なし。admin だけ。rust に無い口。[`crate::email_routing`]) |
-//! | GET | `/api/notify/employees` | 200 `[{id, name, code}]` (社員マスタ。削除済みを除く。社員コードの順。admin だけ。宛先の画面の選択肢。rust に無い口) |
+//! | GET | `/api/notify/employees` | 200 `[{id, name, code, role}]` (社員マスタ。role は役割の配列。削除済みを除く。社員コードの順。admin だけ。宛先の画面の選択肢。rust に無い口) |
 //! | POST | `/api/notify/recipients/link-employees-by-name` | 200 `{dry_run, candidates, skipped, linked}` (admin だけ。rust に無い口。[`link_employees_by_name`]) |
 //! | GET | `/api/notify/recipients/email-status` | 200 `{configured, items: [{recipient_id, email_status}]}` (rust に無い口。[`crate::email_routing`]) |
 //!
