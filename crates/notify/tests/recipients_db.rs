@@ -1707,6 +1707,23 @@ async fn employees_list() {
     let none = employee(t, "丙", None, false).await;
     employee(t, "削除", Some("00"), true).await;
     employee(other, "他社", Some("01"), false).await;
+    // role は employees.role の配列。既定は driver。複数も返す
+    admin()
+        .await
+        .execute(
+            "UPDATE alc_api.employees SET role = ARRAY['driver', 'manager']::text[] WHERE id = $1",
+            &[&b],
+        )
+        .await
+        .unwrap();
+    admin()
+        .await
+        .execute(
+            "UPDATE alc_api.employees SET role = ARRAY['admin']::text[] WHERE id = $1",
+            &[&none],
+        )
+        .await
+        .unwrap();
 
     let got = call_with(
         &app,
@@ -1733,9 +1750,9 @@ async fn employees_list() {
     assert_eq!(
         list,
         json!([
-            {"id": a, "name": "甲", "code": "10"},
-            {"id": b, "name": "乙", "code": "20"},
-            {"id": none, "name": "丙", "code": null},
+            {"id": a, "name": "甲", "code": "10", "role": ["driver"]},
+            {"id": b, "name": "乙", "code": "20", "role": ["driver", "manager"]},
+            {"id": none, "name": "丙", "code": null, "role": ["admin"]},
         ])
     );
     assert!(app.logs.lock().unwrap().is_empty());

@@ -67,7 +67,7 @@ pub mod sql {
     );
 
     /// 社員マスタの選択肢 (削除済みを除く。社員コードの順、コードの無い人は後ろ)
-    pub const LIST_EMPLOYEES: &str = "SELECT id, name, code FROM employees \
+    pub const LIST_EMPLOYEES: &str = "SELECT id, name, code, role FROM employees \
          WHERE tenant_id = $1 AND deleted_at IS NULL ORDER BY code NULLS LAST, name, id";
 
     /// 結び付けてよい社員 (この tenant の、削除されていない社員) か。FK は RLS を通らないので別 tenant の id も通ってしまうため先に確かめる
@@ -577,6 +577,8 @@ pub struct Employee {
     pub id: Uuid,
     pub name: String,
     pub code: Option<String>,
+    /// 役割 (`driver` / `manager` / `admin` など。employees.role の TEXT[])。血圧の日報を受け取れる人 (manager・admin) の判定に使う
+    pub role: Vec<String>,
 }
 
 impl TxOutput for Employee {}
@@ -598,6 +600,7 @@ fn employee(r: &Row) -> Employee {
         id: r.get(0),
         name: r.get(1),
         code: r.get(2),
+        role: r.get(3),
     }
 }
 
