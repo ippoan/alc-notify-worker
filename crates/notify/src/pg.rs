@@ -11,7 +11,7 @@
 //! 詰め替えてから外へ返す。
 
 use alc_worker_db::{PgClient, TxOutput};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use tokio_postgres::types::Type;
 use tokio_postgres::{Error, Row};
@@ -189,10 +189,70 @@ pub mod sql {
     // ---- 配信 (rust の `repo/notify_documents.rs`・`notify_deliveries.rs`・`notify_recipients.rs` の list_enabled・
     //      `notify_groups.rs` の list_enabled_members・`notify_line_config.rs` の get_full) ----
 
-    /// 配信に使う notify_documents の列 ([`super::NotifyDocument`] の並び)。extracted_data は text で読んで JSON にする
-    pub const GET_DOCUMENT: &str = "SELECT id, r2_key, file_name, file_size_bytes, source_subject, source_sender, \
-         extracted_title, extracted_summary, extracted_data::text, redaction_status, redacted_r2_key, created_at \
-         FROM notify_documents WHERE tenant_id = $1 AND id = $2";
+    /// notify_documents の列 ([`super::NotifyDocument`] = rust の `NotifyDocument` の並び)。extracted_data は text で読んで JSON にする
+    macro_rules! document_cols {
+        () => {
+            "id, tenant_id, source_type, source_sender, source_subject, r2_key, file_name, file_size_bytes, \
+             extracted_title, extracted_date, extracted_summary, extracted_phone_numbers, extracted_data::text, \
+             extraction_status, extraction_error, distribution_status, distributed_at, redacted_r2_key, redacted_at, \
+             redactions_applied, redaction_status, redaction_error, redact_dl_ms, redact_llm_ms, redact_render_ms, \
+             redact_upload_ms, redact_total_ms, created_at, updated_at"
+        };
+    }
+
+    /// 配信・閲覧の 1 件 (rust の `get`)
+    pub const GET_DOCUMENT: &str = concat!(
+        "SELECT ",
+        document_cols!(),
+        " FROM notify_documents WHERE tenant_id = $1 AND id = $2"
+    );
+
+    // ---- 閲覧 (rust の `documents.rs` の list・get、`email_documents.rs` の list_emails・get_email、
+    //      `repo/notify_deliveries.rs` の list_by_document) ----
+
+    /// 新しい順 (rust の `list`。`$2` = limit・`$3` = offset)
+    pub const LIST_DOCUMENTS: &str = concat!(
+        "SELECT ",
+        document_cols!(),
+        " FROM notify_documents WHERE tenant_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3"
+    );
+
+    /// 文書の配信の記録 (宛先の名前と送った人)。[`super::DeliveryWithRecipient`] の並び
+    pub const LIST_DELIVERIES_BY_DOCUMENT: &str =
+        "SELECT d.id, d.document_id, d.recipient_id, d.provider, d.status, \
+         d.error_message, d.attempt, d.sent_at, d.read_at, d.read_token, d.created_at, \
+         r.name, d.triggered_by_user_id, u.name, u.email \
+         FROM notify_deliveries d \
+         JOIN notify_recipients r ON r.id = d.recipient_id \
+         LEFT JOIN users u ON u.id = d.triggered_by_user_id \
+         WHERE d.tenant_id = $1 AND d.document_id = $2 \
+         ORDER BY d.created_at DESC, r.name";
+
+    /// メール (email_message_id) ごとの一覧。[`super::EmailSummary`] の並び
+    pub const LIST_EMAILS: &str =
+        "SELECT email_message_id, MAX(source_sender), MAX(source_subject), \
+         MAX(source_received_at), COUNT(*)::BIGINT, SUM(file_size_bytes)::BIGINT, \
+         CASE \
+             WHEN BOOL_AND(distribution_status = 'completed') THEN 'completed' \
+             WHEN BOOL_OR(distribution_status = 'in_progress') THEN 'in_progress' \
+             WHEN BOOL_OR(distribution_status = 'failed') THEN 'failed' \
+             ELSE 'pending' \
+         END, \
+         MAX(created_at) \
+         FROM notify_documents WHERE tenant_id = $1 AND email_message_id IS NOT NULL \
+         GROUP BY email_message_id ORDER BY MAX(created_at) DESC LIMIT 200";
+
+    /// メールの見出し (最初の添付の行)
+    pub const GET_EMAIL_HEADER: &str =
+        "SELECT source_sender, source_subject, source_body_text, source_received_at \
+         FROM notify_documents WHERE tenant_id = $1 AND email_message_id = $2 \
+         ORDER BY created_at ASC LIMIT 1";
+
+    /// メールの添付。[`super::EmailDocument`] の並び
+    pub const LIST_EMAIL_DOCUMENTS: &str = "SELECT id, file_name, file_size_bytes, r2_key, \
+         extraction_status, distribution_status, created_at \
+         FROM notify_documents WHERE tenant_id = $1 AND email_message_id = $2 \
+         ORDER BY created_at ASC, file_name ASC";
 
     pub const LIST_ENABLED_RECIPIENTS: &str = concat!(
         "SELECT ",
@@ -397,24 +457,112 @@ pub struct LineworksChannel {
 
 impl TxOutput for LineworksChannel {}
 
-/// 配信に使う notify_documents の列 (rust の `NotifyDocument` のうち distribute が読むもの)
-#[derive(Debug, Clone, PartialEq)]
+/// notify_documents の 1 行 (rust の `NotifyDocument` と同じ列・同じ JSON。閲覧の口が返し、配信の口が読む)
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct NotifyDocument {
     pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub source_type: String,
+    pub source_sender: Option<String>,
+    pub source_subject: Option<String>,
     pub r2_key: String,
     pub file_name: Option<String>,
     pub file_size_bytes: Option<i64>,
-    pub source_subject: Option<String>,
-    pub source_sender: Option<String>,
     pub extracted_title: Option<String>,
+    pub extracted_date: Option<NaiveDate>,
     pub extracted_summary: Option<String>,
+    pub extracted_phone_numbers: Option<Vec<String>>,
     pub extracted_data: Option<serde_json::Value>,
-    pub redaction_status: String,
+    pub extraction_status: String,
+    pub extraction_error: Option<String>,
+    pub distribution_status: String,
+    pub distributed_at: Option<DateTime<Utc>>,
     pub redacted_r2_key: Option<String>,
+    pub redacted_at: Option<DateTime<Utc>>,
+    pub redactions_applied: Option<i32>,
+    pub redaction_status: String,
+    pub redaction_error: Option<String>,
+    pub redact_dl_ms: Option<i32>,
+    pub redact_llm_ms: Option<i32>,
+    pub redact_render_ms: Option<i32>,
+    pub redact_upload_ms: Option<i32>,
+    pub redact_total_ms: Option<i32>,
     pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 impl TxOutput for NotifyDocument {}
+
+/// 文書の配信の記録 (rust の `NotifyDeliveryWithRecipient`)
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DeliveryWithRecipient {
+    pub id: Uuid,
+    pub document_id: Uuid,
+    pub recipient_id: Uuid,
+    pub provider: String,
+    pub status: String,
+    pub error_message: Option<String>,
+    pub attempt: i32,
+    pub sent_at: Option<DateTime<Utc>>,
+    pub read_at: Option<DateTime<Utc>>,
+    pub read_token: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub recipient_name: String,
+    pub triggered_by_user_id: Option<Uuid>,
+    pub triggered_by_name: Option<String>,
+    pub triggered_by_email: Option<String>,
+}
+
+impl TxOutput for DeliveryWithRecipient {}
+
+/// 文書の 1 件と配信の記録 (rust の get の `{document, deliveries}`)
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DocumentWithDeliveries {
+    pub document: NotifyDocument,
+    pub deliveries: Vec<DeliveryWithRecipient>,
+}
+
+impl TxOutput for DocumentWithDeliveries {}
+
+/// メールの一覧の 1 行 (rust の `EmailSummary`)
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EmailSummary {
+    pub email_message_id: Uuid,
+    pub source_sender: Option<String>,
+    pub source_subject: Option<String>,
+    pub source_received_at: Option<DateTime<Utc>>,
+    pub attachment_count: i64,
+    pub total_size_bytes: Option<i64>,
+    pub distribution_status: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl TxOutput for EmailSummary {}
+
+/// メールの添付 (rust の `EmailDocument`)
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EmailDocument {
+    pub id: Uuid,
+    pub file_name: Option<String>,
+    pub file_size_bytes: Option<i64>,
+    pub r2_key: String,
+    pub extraction_status: String,
+    pub distribution_status: String,
+    pub created_at: DateTime<Utc>,
+}
+
+/// メールの 1 件 (rust の `EmailDetail`)
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EmailDetail {
+    pub email_message_id: Uuid,
+    pub source_sender: Option<String>,
+    pub source_subject: Option<String>,
+    pub source_body_text: Option<String>,
+    pub source_received_at: Option<DateTime<Utc>>,
+    pub documents: Vec<EmailDocument>,
+}
+
+impl TxOutput for EmailDetail {}
 
 /// notify_deliveries に作った 1 行
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -439,19 +587,81 @@ impl TxOutput for LineSecrets {}
 fn document(r: &Row) -> NotifyDocument {
     NotifyDocument {
         id: r.get(0),
-        r2_key: r.get(1),
-        file_name: r.get(2),
-        file_size_bytes: r.get(3),
+        tenant_id: r.get(1),
+        source_type: r.get(2),
+        source_sender: r.get(3),
         source_subject: r.get(4),
-        source_sender: r.get(5),
-        extracted_title: r.get(6),
-        extracted_summary: r.get(7),
+        r2_key: r.get(5),
+        file_name: r.get(6),
+        file_size_bytes: r.get(7),
+        extracted_title: r.get(8),
+        extracted_date: r.get(9),
+        extracted_summary: r.get(10),
+        extracted_phone_numbers: r.get(11),
         extracted_data: r
-            .get::<_, Option<String>>(8)
+            .get::<_, Option<String>>(12)
             .and_then(|s| serde_json::from_str(&s).ok()),
-        redaction_status: r.get(9),
-        redacted_r2_key: r.get(10),
-        created_at: r.get(11),
+        extraction_status: r.get(13),
+        extraction_error: r.get(14),
+        distribution_status: r.get(15),
+        distributed_at: r.get(16),
+        redacted_r2_key: r.get(17),
+        redacted_at: r.get(18),
+        redactions_applied: r.get(19),
+        redaction_status: r.get(20),
+        redaction_error: r.get(21),
+        redact_dl_ms: r.get(22),
+        redact_llm_ms: r.get(23),
+        redact_render_ms: r.get(24),
+        redact_upload_ms: r.get(25),
+        redact_total_ms: r.get(26),
+        created_at: r.get(27),
+        updated_at: r.get(28),
+    }
+}
+
+fn delivery_with_recipient(r: &Row) -> DeliveryWithRecipient {
+    DeliveryWithRecipient {
+        id: r.get(0),
+        document_id: r.get(1),
+        recipient_id: r.get(2),
+        provider: r.get(3),
+        status: r.get(4),
+        error_message: r.get(5),
+        attempt: r.get(6),
+        sent_at: r.get(7),
+        read_at: r.get(8),
+        read_token: r.get(9),
+        created_at: r.get(10),
+        recipient_name: r.get(11),
+        triggered_by_user_id: r.get(12),
+        triggered_by_name: r.get(13),
+        triggered_by_email: r.get(14),
+    }
+}
+
+fn email_summary(r: &Row) -> EmailSummary {
+    EmailSummary {
+        email_message_id: r.get(0),
+        source_sender: r.get(1),
+        source_subject: r.get(2),
+        source_received_at: r.get(3),
+        attachment_count: r.get(4),
+        total_size_bytes: r.get(5),
+        distribution_status: r.get(6),
+        created_at: r.get(7),
+    }
+}
+
+fn email_document(r: &Row) -> EmailDocument {
+    EmailDocument {
+        id: r.get(0),
+        file_name: r.get(1),
+        file_size_bytes: r.get(2),
+        r2_key: r.get(3),
+        extraction_status: r.get(4),
+        distribution_status: r.get(5),
+        created_at: r.get(6),
     }
 }
 
@@ -1085,6 +1295,94 @@ pub async fn get_document(
                 )
                 .await?;
             Ok(row.as_ref().map(document))
+        })
+    })
+    .await
+}
+
+pub async fn list_documents(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<NotifyDocument>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(
+                    sql::LIST_DOCUMENTS,
+                    &[
+                        (&tenant_id, Type::UUID),
+                        (&limit, Type::INT8),
+                        (&offset, Type::INT8),
+                    ],
+                )
+                .await?;
+            Ok(rows.iter().map(document).collect())
+        })
+    })
+    .await
+}
+
+/// 文書と配信の記録を 1 つの transaction で読む (無ければ `None`)
+pub async fn get_document_with_deliveries(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    id: Uuid,
+) -> Result<Option<DocumentWithDeliveries>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let params: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 2] =
+                [(&tenant_id, Type::UUID), (&id, Type::UUID)];
+            let Some(row) = tx.query_typed_opt(sql::GET_DOCUMENT, &params).await? else {
+                return Ok(None);
+            };
+            let deliveries = tx
+                .query_typed(sql::LIST_DELIVERIES_BY_DOCUMENT, &params)
+                .await?;
+            Ok(Some(DocumentWithDeliveries {
+                document: document(&row),
+                deliveries: deliveries.iter().map(delivery_with_recipient).collect(),
+            }))
+        })
+    })
+    .await
+}
+
+pub async fn list_emails(pg: &mut PgClient, tenant_id: Uuid) -> Result<Vec<EmailSummary>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let rows = tx
+                .query_typed(sql::LIST_EMAILS, &[(&tenant_id, Type::UUID)])
+                .await?;
+            Ok(rows.iter().map(email_summary).collect())
+        })
+    })
+    .await
+}
+
+/// メールの見出しと添付 (添付が 1 つも無ければ `None`)
+pub async fn get_email(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    message_id: Uuid,
+) -> Result<Option<EmailDetail>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let params: [(&(dyn tokio_postgres::types::ToSql + Sync), Type); 2] =
+                [(&tenant_id, Type::UUID), (&message_id, Type::UUID)];
+            let Some(header) = tx.query_typed_opt(sql::GET_EMAIL_HEADER, &params).await? else {
+                return Ok(None);
+            };
+            let documents = tx.query_typed(sql::LIST_EMAIL_DOCUMENTS, &params).await?;
+            Ok(Some(EmailDetail {
+                email_message_id: message_id,
+                source_sender: header.get(0),
+                source_subject: header.get(1),
+                source_body_text: header.get(2),
+                source_received_at: header.get(3),
+                documents: documents.iter().map(email_document).collect(),
+            }))
         })
     })
     .await

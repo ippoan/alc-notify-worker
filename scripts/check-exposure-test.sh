@@ -61,5 +61,10 @@ mutate "staging に durable_objects を足す (この worker は DO も Containe
 mutate "staging に hyperdrive (本番の DB へ届く binding) を足す" \
   's = s.replace("[env.staging.observability]", "[[env.staging.hyperdrive]]\nbinding = \"NOTIFY_HYPERDRIVE\"\nid = \"x\"\n\n[env.staging.observability]", 1)'
 
+mutate "staging の NOTIFY_R2 が本番の bucket notify-files を指す" \
+  's = s.replace("bucket_name = \"notify-files-staging\"", "bucket_name = \"notify-files\"", 1)'
+mutate "staging 以外の env の r2_buckets が本番の bucket を指す" \
+  's += "\n[env.other]\nname = \"x\"\nworkers_dev = false\npreview_urls = false\n\n[[env.other.r2_buckets]]\nbinding = \"NOTIFY_R2\"\nbucket_name = \"notify-files\"\n"'
+
 
 exit "$fail"

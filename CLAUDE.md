@@ -1,8 +1,8 @@
 # alc-notify-worker
 
 notify の配信・宛先の Worker `alc-notify` (Refs ippoan/rust-alc-api#747)。rust-alc-api の `crates/alc-notify` のうち、
-配信・宛先・LINE WORKS の口と、LINE・LINE WORKS の webhook の受け口 (W8b) を移す。**文書の取り込み・PDF 加工 (pdfium)・ingest は
-Cloud Run (rust-alc-api) に残っている。** 型は ippoan/alc-lineworks-worker と同じ。
+配信・宛先・LINE WORKS の口と、LINE・LINE WORKS の webhook の受け口 (W8b)、文書とメールの閲覧の口 (W8c-1) を移す。
+**文書の書きの口 (upload・DELETE・redact-recompute・extract-recompute)・取り込み・PDF 加工 (pdfium)・ingest は Cloud Run (rust-alc-api) に残っている。** 型は ippoan/alc-lineworks-worker と同じ。
 **呼び手は auth-worker の Service Binding だけ** (呼び手を認証しない。auth-worker が付けた `X-Tenant-ID` を信頼する)。
 
 いまの口 (path・method・JSON・status は rust と同じ。nuxt-notify と auth-worker がそのまま使う):
@@ -32,6 +32,12 @@ Cloud Run (rust-alc-api) に残っている。** 型は ippoan/alc-lineworks-wor
   - `/api/internal/lineworks/bot-secret/{bot_id}` (GET。`{bot_secret_encrypted}`。404 `bot_not_found`・`bot_secret_not_configured`、500 `lookup_failed`)・
     `/api/internal/lineworks/event` (POST。auth-worker の Durable Object が検証済みのイベントを送る。join/joined でトークルームを足す・
     leave/left で外す。`{ok:true}`。404 `bot_not_found`、500 `lookup_failed`・`upsert_failed`・`mark_left_failed`)
+- 文書とメールの閲覧 (W8c-1。`crates/notify/src/documents.rs`。ファイルは R2 の binding `NOTIFY_R2` (本番 `notify-files`・staging `notify-files-staging`。
+  rust の `NOTIFY_R2_BUCKET` と同じ bucket を読むだけ)。GET だけ — 同じ path の DELETE・POST は auth-worker が Cloud Run へ回す):
+  `/api/notify/documents?limit=&offset=` (既定 50・0)・`/{id}` (`{document, deliveries}`。document は rust の `NotifyDocument` の全列)・
+  `/{id}/preview?original=` (黒塗り済み `redacted_r2_key`、無ければ・`original=true` なら原本。Content-Type は key の拡張子)・
+  `/{id}/download` (原本を `application/octet-stream` の添付)・`/api/notify/emails` (email_message_id ごと 200 件)・`/api/notify/emails/{message_id}`。
+  文書・メールが無ければ 404、R2 の binding が無ければ preview 503・download 500、R2 に無い・読めないなら 500 (rust と同じ)
 - `/api/notify/documents/{id}/distribute` (POST)・`/api/notify/test-distribute` (POST) (配信。viewer の Worker
   (ippoan/nuxt-notify) の `/api/notify/register-view` へ view を登録し、`NOTIFY_FRONTEND_URL` の URL を載せて送る)
 
@@ -47,7 +53,7 @@ channel 宛は行の `bot_config_id`。宛先を Bot ごとに分けたくなっ
 足さない。rust の `lineworks_channels.rs` の `pick_lineworks_bot_config_id` の doc と同じ)。lineworks-worker の `/send` の
 呼び出し側指定 `bot_config_id` は勤怠 (rust-leave-worker) 用の別経路。
 
-直下 = Worker (wasm 専用。DB への経路 `src/db.rs`・lineworks-worker の binding `src/lineworks.rs`・workers-rs への載せ方 `src/lib.rs`)、`crates/notify/` = 口・SQL。
+直下 = Worker (wasm 専用。DB への経路 `src/db.rs`・lineworks-worker の binding `src/lineworks.rs`・workers-rs への載せ方 `src/lib.rs`)、`crates/notify/` = 口・SQL。R2 の読みは `src/r2.rs` (trait は `crates/notify/src/store.rs`)。
 
 ## コマンド
 ```bash
@@ -64,15 +70,15 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
 - 公開範囲を弱めない: 本番・staging とも Service Binding だけ (どの env も `workers_dev`/`preview_urls` = false、route 無し)。
   Hyperdrive (`NOTIFY_HYPERDRIVE`) は本番だけ、staging は VPC (`NOTIFY_DB_VPC`)。`SSO_ENCRYPTION_KEY` (Secrets Store) と
   `ALC_LINEWORKS` (Service Binding)・`INTERNAL_SHARED_SECRET` (Secrets Store。viewer 登録のヘッダ)・`CF_EMAIL_ROUTING_TOKEN` (Secrets Store。Email Routing の送り先)・`[vars]`
-  `NOTIFY_FRONTEND_URL`・`CF_ACCOUNT_ID` は両方の env に書く (binding も vars も env に継承されない)。`wrangler.toml` の表の順を変えない
+  `NOTIFY_FRONTEND_URL`・`CF_ACCOUNT_ID` は両方の env に書く。R2 (`NOTIFY_R2`) も両方に書き、env (staging) は本番の bucket を指さない (scripts/check-exposure.sh が検査) (binding も vars も env に継承されない)。`wrangler.toml` の表の順を変えない
   (新しい表は placement より後。`[env.staging]` と `[env.staging.observability]` の間に挟まない)。
 - **ログ・エラー応答は固定の語だけ。** `{e}`・DB の message・識別子 (tenant_id・行 id)・入力の値を出さない。
   DB の失敗は `notify: <段> failed: db (<kind>)` (kind は SQLSTATE か tokio-postgres の種類の label)。
 - DB は `PgClient::tenant_tx` + `query_typed` 系だけ。SQL は `crates/notify/src/pg.rs` の 1 か所。
   名前付き prepared statement 禁止。Row を transaction の外へ持ち出さない (owned な型に `TxOutput`)。
   tenant_id の列が在る表は WHERE にも tenant_id を書く。
-- rust に無い検査 (role など) を足さない。rust と違う振る舞いにするときは理由を書く (いまは 6 つ: (1) members の POST と bulk のグループ追加は、宛先が同じ tenant に無ければ何も足さない。POST は 404。RLS の WITH CHECK が group の tenant しか見ないため。(2) LINE WORKS の口の失敗の本文は lineworks-worker の status と語 (`error`・`missing_scope` の `scope`・語の形の `message`) だけを写し、自由文 (rust の 502 の `message`) は載せない。tenant に bot が無いときの語は lineworks-worker の `bot_config_not_found` (rust は `no_lineworks_config`。画面は status しか見ない)。ログに上流の文を出さないため。(3) 宛先の保存で Cloudflare の送り先を作るのは `X-User-Role` が `admin` のときだけ (それ以外は宛先は保存するが送り先は作らない)。任意のアドレスに Cloudflare の確認メールが飛ぶため。`email-status` は読むだけなので role を見ない。(4) 確認メールの再送は、未確認の送り先に限り消して作り直す (Cloudflare に再送の API が無いため。確認済みは消さない。「宛先を消しても・変えても送り先は消さない」の、未確認に限った例外。ユーザー決定 2026-10-19)；(5) 宛先の POST / PUT は provider ごとの必須を検査して 400 (`line` は line_user_id・`lineworks` は lineworks_user_id・`email` は email。空白だけも空。PUT は既存の行と入力を合成して検査する。理由: 画面を経由しない呼び出しでも DB の CHECK `at_least_one_messaging_id` 違反の 500 にしないため。bulk は LINE WORKS の一括登録なので変えない)。加えて provider `email` の宛先は文書配信の対象外 (全員・グループ・指定のどれでも delivery 行も送信も作らない。LINE / LINE WORKS の ID を持たないため。`send_to_recipient` の `UnknownProvider` はそのまま)；(6) 宛先と社員の結び付け (PUT の `employee_id`・社員の一覧・氏名での自動結合) は admin だけ (403 `forbidden`)。誰の測定結果が誰に届くかを決めるため。社員の存在は tenant で確かめる (FK は RLS を通らず別 tenant の id も通るため))。
-- `coverage_100.toml` の登録を外さない。CI の本数 (recipients_db 29・lineworks_db 7・distribute_db 10・inbound_db 9。
+- rust に無い検査 (role など) を足さない。rust と違う振る舞いにするときは理由を書く (いまは 7 つ: (1) members の POST と bulk のグループ追加は、宛先が同じ tenant に無ければ何も足さない。POST は 404。RLS の WITH CHECK が group の tenant しか見ないため。(2) LINE WORKS の口の失敗の本文は lineworks-worker の status と語 (`error`・`missing_scope` の `scope`・語の形の `message`) だけを写し、自由文 (rust の 502 の `message`) は載せない。tenant に bot が無いときの語は lineworks-worker の `bot_config_not_found` (rust は `no_lineworks_config`。画面は status しか見ない)。ログに上流の文を出さないため。(3) 宛先の保存で Cloudflare の送り先を作るのは `X-User-Role` が `admin` のときだけ (それ以外は宛先は保存するが送り先は作らない)。任意のアドレスに Cloudflare の確認メールが飛ぶため。`email-status` は読むだけなので role を見ない。(4) 確認メールの再送は、未確認の送り先に限り消して作り直す (Cloudflare に再送の API が無いため。確認済みは消さない。「宛先を消しても・変えても送り先は消さない」の、未確認に限った例外。ユーザー決定 2026-10-19)；(5) 宛先の POST / PUT は provider ごとの必須を検査して 400 (`line` は line_user_id・`lineworks` は lineworks_user_id・`email` は email。空白だけも空。PUT は既存の行と入力を合成して検査する。理由: 画面を経由しない呼び出しでも DB の CHECK `at_least_one_messaging_id` 違反の 500 にしないため。bulk は LINE WORKS の一括登録なので変えない)。加えて provider `email` の宛先は文書配信の対象外 (全員・グループ・指定のどれでも delivery 行も送信も作らない。LINE / LINE WORKS の ID を持たないため。`send_to_recipient` の `UnknownProvider` はそのまま)；(6) 宛先と社員の結び付け (PUT の `employee_id`・社員の一覧・氏名での自動結合) は admin だけ (403 `forbidden`)。誰の測定結果が誰に届くかを決めるため。社員の存在は tenant で確かめる (FK は RLS を通らず別 tenant の id も通るため)；(7) 文書の preview・download の `Content-Disposition` は ASCII だけで組み (`filename*` に UTF-8 の percent-encoding。rust は生の UTF-8。Workers がヘッダの非 ASCII をファイル名入りの警告でログに出すため。ippoan/alc-carins-worker と同じ)、`X-Content-Type-Options: nosniff` を付け、preview を inline で返すのは pdf と画像 (png・jpeg・gif・webp) だけ (svg・txt は `application/octet-stream` の添付。rust は inline。同じ origin で script が動かないよう nuxt-notify の `isSafeInline` と同じ範囲に絞る))。
+- `coverage_100.toml` の登録を外さない。CI の本数 (recipients_db 29・lineworks_db 7・distribute_db 10・inbound_db 9・documents_db 9。
   `.github/workflows/ci.yml` の gate) はテストを足したら上げる。
 - public repo: ホスト名・account ID・tenant UUID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
   例外: 利用者に配る公開の viewer URL `NOTIFY_FRONTEND_URL` は wrangler.toml の `[vars]` に平文で置く

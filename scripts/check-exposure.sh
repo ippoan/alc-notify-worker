@@ -15,6 +15,8 @@
 #     env.staging にだけ置く
 #   - どの階層にも (トップレベル・env 配下とも) durable_objects と containers が無い
 #     (この worker は Durable Object も Container も持たない)
+#   - env 配下 (env.staging を含む) の r2_buckets が本番の bucket (トップレベルの r2_buckets の bucket_name) を指さない
+#     (本番の文書のファイルを読む)
 #   - env 配下 (env.staging を含む) に hyperdrive が無い (ippoan/rust-alc-api#723)。Hyperdrive の binding は本番の DB へ
 #     届くので、トップレベル (本番) にだけ置く (staging に置かない)
 # 違えば exit 1。CI で毎回走らせる。陰性対照は scripts/check-exposure-test.sh。
@@ -76,6 +78,13 @@ for scope, table in [("トップレベル", cfg)] + [(f"env.{n}", e) for n, e in
 for name, e in envs.items():
     if e.get("hyperdrive"):
         err(f"env.{name} に hyperdrive がある (本番の DB へ届く binding。トップレベルにだけ置く)")
+
+# 本番の R2 の bucket を env 配下 (staging を含む) から指さない (本番の文書のファイルを読む)
+prod_buckets = {b.get("bucket_name") for b in cfg.get("r2_buckets", [])}
+for name, e in envs.items():
+    for b in e.get("r2_buckets", []):
+        if b.get("bucket_name") in prod_buckets:
+            err(f"env.{name} の r2_buckets が本番の bucket {b['bucket_name']} を指している (env 用の bucket を指すこと)")
 
 if errors:
     sys.exit(1)

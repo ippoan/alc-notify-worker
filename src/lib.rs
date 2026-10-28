@@ -9,6 +9,7 @@
 //! 秘密値 `SSO_ENCRYPTION_KEY` (Secrets Store) は line-config の POST・LINE の webhook・配信の口でだけ、`INTERNAL_SHARED_SECRET`
 //! (Secrets Store、viewer の register-view の認証) は配信の口でだけ引く。`CF_EMAIL_ROUTING_TOKEN` (Secrets Store) と
 //! `CF_ACCOUNT_ID` (`[vars]`) (Cloudflare Email Routing の送り先の登録) は宛先の保存と email-status の口でだけ引く ([`email_routing`])。配信の外への POST (LINE・viewer) は [`http`]。
+//! 文書のファイル (閲覧の preview・download) は R2 の binding `NOTIFY_R2` ([`r2`])。
 
 // worker 本体は wasm32 専用。native の `cargo build` / `clippy` / `test` (workspace の root で打つもの) では空の crate にして、
 // crates/notify だけを検査させる
@@ -18,6 +19,7 @@ mod db;
 mod email_routing;
 mod http;
 mod lineworks;
+mod r2;
 mod tcp;
 
 use std::sync::{Arc, OnceLock};
@@ -31,6 +33,7 @@ use notify::line::{LineEndpoints, LineTokenCache};
 use notify::line_config::LINE_CONFIG_PATH;
 use notify::line_webhook::LINE_WEBHOOK_PATH;
 use notify::lineworks::LineworksApi;
+use notify::store::SharedStore;
 use notify::{router, LogSink, NotifyState};
 use tower_service::Service;
 use worker::{
@@ -40,6 +43,7 @@ use worker::{
 use crate::email_routing::{CloudflareEmailRouting, NoEmailRouting};
 use crate::http::WorkerHttp;
 use crate::lineworks::{LineworksBinding, NoLineworks};
+use crate::r2::R2Store;
 
 /// line-config の秘密値の暗号化の鍵 (Secrets Store。auth-worker・alc-lineworks-worker と同じ secret)。LINE の webhook の
 /// 署名の照合 (channel secret の復号) にも使う
@@ -55,6 +59,10 @@ const NOTIFY_FRONTEND_URL_VAR: &str = "NOTIFY_FRONTEND_URL";
 const CF_EMAIL_ROUTING_TOKEN_BINDING: &str = "CF_EMAIL_ROUTING_TOKEN";
 /// Cloudflare の account ID (wrangler.toml の vars。他の Worker と同じく平文)
 const CF_ACCOUNT_ID_BINDING: &str = "CF_ACCOUNT_ID";
+
+/// 文書のファイルの R2 の binding (wrangler.toml の `[[r2_buckets]]`。本番と staging で別の bucket)。
+/// 無ければ preview は 503・download は 500 (rust の storage 無しと同じ)
+const NOTIFY_R2_BINDING: &str = "NOTIFY_R2";
 
 /// LINE の channel access token の置き場 (isolate の間ずっと持つ。キーは channel ごと)
 fn line_tokens() -> Arc<LineTokenCache> {
@@ -104,6 +112,12 @@ async fn email_routing_api(env: &Env, needed: bool) -> Arc<dyn EmailRoutingApi> 
         (Some(token), Some(account_id)) => Arc::new(CloudflareEmailRouting::new(token, account_id)),
         _ => Arc::new(NoEmailRouting),
     }
+}
+
+fn files(env: &Env) -> Option<SharedStore> {
+    env.bucket(NOTIFY_R2_BINDING)
+        .ok()
+        .map(|b| Arc::new(R2Store::new(b)) as SharedStore)
 }
 
 fn log_sink() -> LogSink {
@@ -170,6 +184,7 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
         email_routing,
         sso_key,
         outbound,
+        files: files(&env),
         log: log_sink(),
     };
     let mut resp = match router().with_state(state).call(req).await {

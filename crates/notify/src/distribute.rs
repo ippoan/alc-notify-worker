@@ -613,18 +613,10 @@ mod tests {
 
     fn build_doc() -> NotifyDocument {
         NotifyDocument {
-            id: Uuid::nil(),
             r2_key: "k".into(),
             file_name: Some("haisou.pdf".into()),
-            file_size_bytes: None,
-            source_subject: None,
-            source_sender: None,
-            extracted_title: None,
-            extracted_summary: None,
-            extracted_data: None,
             redaction_status: "completed".into(),
-            redacted_r2_key: None,
-            created_at: DateTime::<Utc>::default(),
+            ..NotifyDocument::default()
         }
     }
 
