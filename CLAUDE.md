@@ -2,8 +2,9 @@
 
 notify の配信・宛先の Worker `alc-notify` (Refs ippoan/rust-alc-api#747)。rust-alc-api の `crates/alc-notify` のうち、
 配信・宛先・LINE WORKS の口と、LINE・LINE WORKS の webhook の受け口 (W8b)、文書とメールの閲覧の口 (W8c-1) を移す。
-抽出・黒塗りの背景処理とやり直しの口 (W8c-2 の PR-3a) も持つ。**文書の upload・DELETE・メールの取り込み (ingest) は Cloud Run (rust-alc-api) に残っている (PR-3b で移す)。** 型は ippoan/alc-lineworks-worker と同じ。
-**呼び手は auth-worker の Service Binding だけ** (呼び手を認証しない。auth-worker が付けた `X-Tenant-ID` を信頼する)。
+文書の書きの口 (upload・DELETE)・メールの取り込み (ingest)・抽出と黒塗りの背景処理とやり直しの口 (W8c-2) も持つ (rust の notify の口は残らない)。 型は ippoan/alc-lineworks-worker と同じ。
+**呼び手は auth-worker の Service Binding だけ** (呼び手を認証しない。auth-worker が付けた `X-Tenant-ID` を信頼する)。例外は ingest で、
+呼び手は nuxt-notify の email-receiver の Service Binding (`NOTIFY`) だけ。**ingest を auth-worker の振り分け表 (`ALC_BINDING_ROUTES`) に載せない** (載せると外からどの tenant にも書ける)。
 
 いまの口 (path・method・JSON・status は rust と同じ。nuxt-notify と auth-worker がそのまま使う):
 - `/api/notify/recipients/{id}/resend-verification` (POST。本文なし。確認メールの再送。rust に無い口。admin だけ。無ければ作って `{status:"created"}`、
@@ -33,11 +34,18 @@ notify の配信・宛先の Worker `alc-notify` (Refs ippoan/rust-alc-api#747)�
     `/api/internal/lineworks/event` (POST。auth-worker の Durable Object が検証済みのイベントを送る。join/joined でトークルームを足す・
     leave/left で外す。`{ok:true}`。404 `bot_not_found`、500 `lookup_failed`・`upsert_failed`・`mark_left_failed`)
 - 文書とメールの閲覧 (W8c-1。`crates/notify/src/documents.rs`。ファイルは R2 の binding `NOTIFY_R2` (本番 `notify-files`・staging `notify-files-staging`。
-  rust の `NOTIFY_R2_BUCKET` と同じ bucket を読むだけ)。GET だけ — 同じ path の DELETE・POST は auth-worker が Cloud Run へ回す):
+  rust の `NOTIFY_R2_BUCKET` と同じ bucket):
   `/api/notify/documents?limit=&offset=` (既定 50・0)・`/{id}` (`{document, deliveries}`。document は rust の `NotifyDocument` の全列)・
   `/{id}/preview?original=` (黒塗り済み `redacted_r2_key`、無ければ・`original=true` なら原本。Content-Type は key の拡張子)・
   `/{id}/download` (原本を `application/octet-stream` の添付)・`/api/notify/emails` (email_message_id ごと 200 件)・`/api/notify/emails/{message_id}`。
   文書・メールが無ければ 404、R2 の binding が無ければ preview 503・download 500、R2 に無い・読めないなら 500 (rust と同じ)
+- 文書の削除・upload・取り込み (W8c-2 PR-3b): `DELETE /api/notify/documents/{id}` (`documents.rs`。無ければ 404、行を消し (配信の記録は CASCADE)、
+  R2 の原本も消す (失敗はログだけ)。204)・`POST /api/notify/documents/upload` (`intake.rs`。multipart。pdf・docx・xlsx・png・jpg・jpeg 以外 400、
+  0 件 400、20 件超・25 MiB 超 413。R2 `{tenant}/manual/{batch}/{名前}`。201 `{document_ids, count}`)・`POST /api/notify/ingest` (`intake.rs`。
+  **tenant の layer の外**、Service Binding の信頼だけ (`X-Worker-Secret` は見ない)。`tenant_short_id` → `tenants.short_id` (空 400・無い 404)、
+  添付 0 件 400・21 件以上 413・base64 が読めない 400・25 MiB 超 413。R2 `{tenant}/email/{email_message_id}/{名前}`。201 `{email_message_id, document_ids, count}`)。
+  本文の上限は rust と同じ 20 MiB。PDF は黒塗り・全部で抽出を queue に積む (積めなくても 201)。行は 1 つの transaction で作る (rust は 1 件ずつ)。
+  batch・email_message_id は DB の `gen_random_uuid()`
 - 抽出・黒塗りのやり直し (W8c-2。`crates/notify/src/recompute.rs`): `/api/notify/documents/{id}/redact-recompute` (POST。黒塗りの結果を空にして
   `pending` へ戻し queue に積む。戻せなければ 500)・`/{id}/extract-recompute` (POST。`extraction_status` を `pending` へ戻し (失敗はログだけ) queue に積む)。
   どちらも 202 本文なし・文書が無ければ 404・queue に積めなければ 500 (rust の `tokio::spawn` は失敗しない)
@@ -94,7 +102,7 @@ DB テストは使い捨ての postgres:17 へ。URL が無ければ失敗 (skip
   名前付き prepared statement 禁止。Row を transaction の外へ持ち出さない (owned な型に `TxOutput`)。
   tenant_id の列が在る表は WHERE にも tenant_id を書く。
 - rust に無い検査 (role など) を足さない。rust と違う振る舞いにするときは理由を書く (いまは 7 つ: (1) members の POST と bulk のグループ追加は、宛先が同じ tenant に無ければ何も足さない。POST は 404。RLS の WITH CHECK が group の tenant しか見ないため。(2) LINE WORKS の口の失敗の本文は lineworks-worker の status と語 (`error`・`missing_scope` の `scope`・語の形の `message`) だけを写し、自由文 (rust の 502 の `message`) は載せない。tenant に bot が無いときの語は lineworks-worker の `bot_config_not_found` (rust は `no_lineworks_config`。画面は status しか見ない)。ログに上流の文を出さないため。(3) 宛先の保存で Cloudflare の送り先を作るのは `X-User-Role` が `admin` のときだけ (それ以外は宛先は保存するが送り先は作らない)。任意のアドレスに Cloudflare の確認メールが飛ぶため。`email-status` は読むだけなので role を見ない。(4) 確認メールの再送は、未確認の送り先に限り消して作り直す (Cloudflare に再送の API が無いため。確認済みは消さない。「宛先を消しても・変えても送り先は消さない」の、未確認に限った例外。ユーザー決定 2026-10-19)；(5) 宛先の POST / PUT は provider ごとの必須を検査して 400 (`line` は line_user_id・`lineworks` は lineworks_user_id・`email` は email。空白だけも空。PUT は既存の行と入力を合成して検査する。理由: 画面を経由しない呼び出しでも DB の CHECK `at_least_one_messaging_id` 違反の 500 にしないため。bulk は LINE WORKS の一括登録なので変えない)。加えて provider `email` の宛先は文書配信の対象外 (全員・グループ・指定のどれでも delivery 行も送信も作らない。LINE / LINE WORKS の ID を持たないため。`send_to_recipient` の `UnknownProvider` はそのまま)；(6) 宛先と社員の結び付け (PUT の `employee_id`・社員の一覧・氏名での自動結合) は admin だけ (403 `forbidden`)。誰の測定結果が誰に届くかを決めるため。社員の存在は tenant で確かめる (FK は RLS を通らず別 tenant の id も通るため)；(7) 文書の preview・download の `Content-Disposition` は ASCII だけで組み (`filename*` に UTF-8 の percent-encoding。rust は生の UTF-8。Workers がヘッダの非 ASCII をファイル名入りの警告でログに出すため。ippoan/alc-carins-worker と同じ)、`X-Content-Type-Options: nosniff` を付け、preview を inline で返すのは pdf と画像 (png・jpeg・gif・webp) だけ (svg・txt は `application/octet-stream` の添付。rust は inline。同じ origin で script が動かないよう nuxt-notify の `isSafeInline` と同じ範囲に絞る))。
-- `coverage_100.toml` の登録を外さない。CI の本数 (recipients_db 29・lineworks_db 7・distribute_db 10・inbound_db 9・documents_db 9・background_db 12。
+- `coverage_100.toml` の登録を外さない。CI の本数 (recipients_db 29・lineworks_db 7・distribute_db 10・inbound_db 9・documents_db 9・background_db 12・intake_db 7。
   `.github/workflows/ci.yml` の gate) はテストを足したら上げる。
 - public repo: ホスト名・account ID・tenant UUID・個人情報を書かない。`v*` タグ = 本番 (Tag Release 手動)。
   例外: 利用者に配る公開の viewer URL `NOTIFY_FRONTEND_URL` は wrangler.toml の `[vars]` に平文で置く

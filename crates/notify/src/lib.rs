@@ -14,7 +14,9 @@
 //! - [`lineworks_webhook`] — LINE WORKS の webhook の受け口 (`GET /api/internal/lineworks/bot-secret/{bot_id}`・
 //!   `POST /api/internal/lineworks/event`。auth-worker の Durable Object が呼ぶ)
 //! - [`documents`] — 文書とメールの閲覧 (`GET /api/notify/documents`・`/{id}`・`/{id}/preview`・`/{id}/download`・
-//!   `GET /api/notify/emails`・`/{message_id}`)。ファイルは R2 ([`store::FileStore`])。upload・DELETE は Cloud Run に残る (W8c-2 の PR-3b で移す)
+//!   `GET /api/notify/emails`・`/{message_id}`)。ファイルは R2 ([`store::FileStore`])。削除 (DELETE) もここ
+//! - [`intake`] — 文書の upload (`POST /api/notify/documents/upload`) とメールの取り込み (`POST /api/notify/ingest`。tenant の
+//!   layer の外で、Service Binding の信頼だけ。auth-worker の振り分け表には載せない)
 //! - [`recompute`] — 抽出・黒塗りのやり直し (`POST /api/notify/documents/{id}/redact-recompute`・`/extract-recompute`。
 //!   Cloudflare Queues へ積む [`jobs`])
 //! - [`background`] — 抽出と黒塗りの背景処理 (Queues の consumer。alc-redact を auth-worker の RPC 越しに呼ぶ)
@@ -36,6 +38,7 @@ pub mod documents;
 pub mod email_routing;
 pub mod groups;
 pub mod http;
+pub mod intake;
 pub mod jobs;
 pub mod line;
 pub mod line_config;
@@ -107,7 +110,9 @@ pub fn router() -> Router<NotifyState> {
         .merge(distribute::router())
         .merge(documents::router())
         .merge(recompute::router())
+        .merge(intake::upload_router())
         .route_layer(middleware::from_fn(require_tenant_header))
+        .merge(intake::ingest_router())
         .merge(line_webhook::router())
         .merge(lineworks_webhook::router())
 }

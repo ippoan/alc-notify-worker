@@ -322,6 +322,28 @@ pub mod sql {
     /// 抽出の自社名 (rust の `get_tenant_by_id` の name。tenants に RLS は無い)
     pub const GET_TENANT_NAME: &str = "SELECT name FROM tenants WHERE id = $1";
 
+    // ---- 文書の upload・取り込み・削除 (W8c-2 PR-3b。rust の `documents.rs` の upload・`ingest.rs`・`email_documents.rs` の delete) ----
+
+    /// upload の batch・メールの email_message_id (wasm で乱数の crate を持たないので DB で作る。ippoan/alc-trouble-worker と同じ)
+    pub const NEW_UUID: &str = "SELECT gen_random_uuid()";
+
+    /// メールの宛先の short_id から tenant を引く (tenant が決まる前の読み。tenants に RLS は無い)
+    pub const TENANT_BY_SHORT_ID: &str = "SELECT id FROM tenants WHERE short_id = $1";
+
+    pub const INSERT_MANUAL_DOCUMENT: &str = "INSERT INTO notify_documents (\
+         tenant_id, source_type, r2_key, file_name, file_size_bytes, source_received_at, \
+         extraction_status, distribution_status) \
+         VALUES ($1, 'manual', $2, $3, $4, NOW(), 'pending', 'pending') RETURNING id";
+
+    pub const INSERT_EMAIL_DOCUMENT: &str = "INSERT INTO notify_documents (\
+         tenant_id, source_type, source_sender, source_subject, r2_key, file_name, file_size_bytes, \
+         email_message_id, source_body_text, source_received_at, extraction_status, distribution_status) \
+         VALUES ($1, 'email', $2, $3, $4, $5, $6, $7, $8, $9, 'pending', 'pending') RETURNING id";
+
+    /// 配信の記録は ON DELETE CASCADE。消した文書の r2_key を返す
+    pub const DELETE_DOCUMENT: &str =
+        "DELETE FROM notify_documents WHERE tenant_id = $1 AND id = $2 RETURNING r2_key";
+
     pub const CREATE_DELIVERY: &str =
         "INSERT INTO notify_deliveries (tenant_id, document_id, recipient_id, provider) \
          VALUES ($1, $2, $3, $4) RETURNING id, recipient_id, read_token";
@@ -1904,6 +1926,122 @@ pub async fn get_tenant_name(pg: &mut PgClient, tenant_id: Uuid) -> Result<Optio
         Box::pin(async move {
             let row = tx
                 .query_typed_opt(sql::GET_TENANT_NAME, &[(&tenant_id, Type::UUID)])
+                .await?;
+            Ok(row.map(|r| r.get::<_, String>(0)))
+        })
+    })
+    .await
+}
+
+// ---- 文書の upload・取り込み・削除 (W8c-2 PR-3b) ----
+
+pub async fn new_uuid(pg: &mut PgClient, tenant_id: Uuid) -> Result<Uuid, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let row = tx.query_typed_one(sql::NEW_UUID, &[]).await?;
+            Ok(row.get::<_, Uuid>(0))
+        })
+    })
+    .await
+}
+
+/// tenant が決まる前の読み (`tenant_tx(Uuid::nil())` の中で tenants だけを読む。webhook の受け口と同じ型)
+pub async fn tenant_by_short_id(
+    pg: &mut PgClient,
+    short_id: String,
+) -> Result<Option<Uuid>, Error> {
+    pg.tenant_tx(Uuid::nil(), move |tx| {
+        Box::pin(async move {
+            let row = tx
+                .query_typed_opt(sql::TENANT_BY_SHORT_ID, &[(&short_id, Type::TEXT)])
+                .await?;
+            Ok(row.map(|r| r.get::<_, Uuid>(0)))
+        })
+    })
+    .await
+}
+
+/// R2 に置いた 1 ファイル (行に入れるもの)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredFile {
+    pub r2_key: String,
+    pub file_name: String,
+    pub size: i64,
+}
+
+/// 取り込んだメールの列 (upload は `None`)
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmailSource {
+    pub message_id: Uuid,
+    pub from: Option<String>,
+    pub subject: Option<String>,
+    pub body_text: Option<String>,
+    pub received_at: DateTime<Utc>,
+}
+
+/// 文書の行を渡した順に作る (1 つの transaction)
+pub async fn insert_documents(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    files: Vec<StoredFile>,
+    email: Option<EmailSource>,
+) -> Result<Vec<Uuid>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let mut ids = Vec::with_capacity(files.len());
+            for f in &files {
+                let row = match &email {
+                    None => {
+                        tx.query_typed_one(
+                            sql::INSERT_MANUAL_DOCUMENT,
+                            &[
+                                (&tenant_id, Type::UUID),
+                                (&f.r2_key, Type::TEXT),
+                                (&f.file_name, Type::TEXT),
+                                (&f.size, Type::INT8),
+                            ],
+                        )
+                        .await?
+                    }
+                    Some(e) => {
+                        tx.query_typed_one(
+                            sql::INSERT_EMAIL_DOCUMENT,
+                            &[
+                                (&tenant_id, Type::UUID),
+                                (&e.from, Type::TEXT),
+                                (&e.subject, Type::TEXT),
+                                (&f.r2_key, Type::TEXT),
+                                (&f.file_name, Type::TEXT),
+                                (&f.size, Type::INT8),
+                                (&e.message_id, Type::UUID),
+                                (&e.body_text, Type::TEXT),
+                                (&e.received_at, Type::TIMESTAMPTZ),
+                            ],
+                        )
+                        .await?
+                    }
+                };
+                ids.push(row.get::<_, Uuid>(0));
+            }
+            Ok(ids)
+        })
+    })
+    .await
+}
+
+/// 消した文書の r2_key (無ければ `None`)
+pub async fn delete_document(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    id: Uuid,
+) -> Result<Option<String>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let row = tx
+                .query_typed_opt(
+                    sql::DELETE_DOCUMENT,
+                    &[(&tenant_id, Type::UUID), (&id, Type::UUID)],
+                )
                 .await?;
             Ok(row.map(|r| r.get::<_, String>(0)))
         })

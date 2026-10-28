@@ -519,6 +519,9 @@ pub struct MockStore {
     pub puts: StdMutex<Vec<(String, String)>>,
     pub fail_get: AtomicBool,
     pub fail_put: AtomicBool,
+    pub fail_delete: AtomicBool,
+    /// delete のキー
+    pub deletes: StdMutex<Vec<String>>,
 }
 
 impl MockStore {
@@ -560,6 +563,17 @@ impl FileStore for MockStore {
                 .unwrap()
                 .push((key.to_owned(), content_type.to_owned()));
             self.objects.lock().unwrap().insert(key.to_owned(), bytes);
+            Ok(())
+        })
+    }
+
+    fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            self.deletes.lock().unwrap().push(key.to_owned());
+            if self.fail_delete.load(Ordering::SeqCst) {
+                return Err(StoreError("delete"));
+            }
+            self.objects.lock().unwrap().remove(key);
             Ok(())
         })
     }
