@@ -13,6 +13,8 @@
 //! - [`line_webhook`] — LINE の webhook の受け口 (`POST /api/internal/notify/line/webhook`。auth-worker が raw body と署名を渡す)
 //! - [`lineworks_webhook`] — LINE WORKS の webhook の受け口 (`GET /api/internal/lineworks/bot-secret/{bot_id}`・
 //!   `POST /api/internal/lineworks/event`。auth-worker の Durable Object が呼ぶ)
+//! - [`documents`] — 文書とメールの閲覧 (`GET /api/notify/documents`・`/{id}`・`/{id}/preview`・`/{id}/download`・
+//!   `GET /api/notify/emails`・`/{message_id}`)。ファイルは R2 ([`store::FileStore`])。書きの口は Cloud Run に残る
 //! - [`pg`] — SQL (`PgClient::tenant_tx` + `query_typed` 系だけ)
 //!
 //! path・method・JSON の形・status は rust と同じ (nuxt-notify と auth-worker がそのまま使う)。path の頭の `/api` は、
@@ -26,6 +28,7 @@
 
 pub mod channels;
 pub mod distribute;
+pub mod documents;
 pub mod email_routing;
 pub mod groups;
 pub mod http;
@@ -36,6 +39,7 @@ pub mod lineworks;
 pub mod lineworks_webhook;
 pub mod pg;
 pub mod recipients;
+pub mod store;
 pub mod viewer_register;
 
 use std::sync::Arc;
@@ -48,6 +52,7 @@ use distribute::Outbound;
 use email_routing::EmailRoutingApi;
 use futures_util::lock::Mutex;
 use lineworks::LineworksApi;
+use store::SharedStore;
 
 pub type LogSink = Arc<dyn Fn(&str) + Send + Sync>;
 
@@ -62,6 +67,8 @@ pub struct NotifyState {
     pub sso_key: Option<Arc<str>>,
     /// 配信の外への送信 (LINE・viewer の KV への登録) に要るもの
     pub outbound: Outbound,
+    /// 文書のファイル (R2 の binding `NOTIFY_R2`)。無ければ preview は 503・download は 500 (rust の storage 無しと同じ)
+    pub files: Option<SharedStore>,
     pub log: LogSink,
 }
 
@@ -89,6 +96,7 @@ pub fn router() -> Router<NotifyState> {
         .merge(channels::router())
         .merge(lineworks::router())
         .merge(distribute::router())
+        .merge(documents::router())
         .route_layer(middleware::from_fn(require_tenant_header))
         .merge(line_webhook::router())
         .merge(lineworks_webhook::router())

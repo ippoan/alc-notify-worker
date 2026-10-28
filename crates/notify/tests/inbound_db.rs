@@ -82,11 +82,16 @@ async fn line_webhook(app: &App, body: &[u8], signature: Option<String>) -> Got 
         .await
         .unwrap();
     let status = resp.status().as_u16();
+    let headers = resp.headers().clone();
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap()
         .to_vec();
-    Got { status, body }
+    Got {
+        status,
+        headers,
+        body,
+    }
 }
 
 fn follow(user_id: &str) -> Value {

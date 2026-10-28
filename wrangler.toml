@@ -74,6 +74,12 @@ NOTIFY_FRONTEND_URL = "https://notify.ippoan.org"
 # account ID は他の Worker と同じく平文 (ユーザー決定 2026-10-19、Refs ippoan/alc-app#436)。Email Routing の API の宛先 (src/email_routing.rs)
 CF_ACCOUNT_ID = "24b45709d060d957340180e995f0d373"
 
+# 本番の R2 (文書のファイルの置き場。rust-alc-api の NOTIFY_R2_BUCKET と同じ bucket で、既存のファイルをそのまま読む。
+# 閲覧の口 (preview・download) が読むだけ)。binding は env に継承されないので、staging は下で別の bucket を指す
+[[r2_buckets]]
+binding = "NOTIFY_R2"
+bucket_name = "notify-files"
+
 # staging: DB は ippoan/alc-vein-worker の staging と同じもの (Workers VPC の binding NOTIFY_DB_VPC から
 # 既存の Tunnel 経由で PgBouncer へ繋ぐ。src/db.rs)。Hyperdrive は通さない。
 [env.staging]
@@ -117,6 +123,12 @@ secret_name = "INTERNAL_SHARED_SECRET"
 binding = "CF_EMAIL_ROUTING_TOKEN"
 store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
 secret_name = "cf-email-routing-token"
+
+# staging の R2 は staging 用の bucket (rust-alc-api の staging と同じ。本番の bucket を指すと本番のファイルを読む。
+# scripts/check-exposure.sh が検査)
+[[env.staging.r2_buckets]]
+binding = "NOTIFY_R2"
+bucket_name = "notify-files-staging"
 
 [env.staging.vars]
 NOTIFY_FRONTEND_URL = "https://notify-staging.ippoan.org"

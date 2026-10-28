@@ -10,12 +10,13 @@
 
 #![allow(dead_code)]
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use alc_worker_db::PgClient;
 use axum::body::Body;
-use axum::http::Request;
+use axum::http::{HeaderMap, Request};
 use axum::Router;
 use futures_util::future::BoxFuture;
 use futures_util::lock::Mutex;
@@ -24,6 +25,7 @@ use notify::email_routing::{EmailRoutingApi, ErMethod, ErRequest, ErResponse, Er
 use notify::http::{Http, HttpError, HttpRequest, HttpResponse};
 use notify::line::{LineEndpoints, LineTokenCache};
 use notify::lineworks::{LineworksApi, LwRequest, LwResponse, LwUnreachable};
+use notify::store::{FileStore, SharedStore, StoreError};
 use notify::{router, NotifyState};
 use tokio::sync::OnceCell;
 use tokio_postgres::{Client, Config, NoTls};
@@ -508,6 +510,38 @@ pub const REGISTER_URL: &str = "https://viewer.test/api/notify/register-view";
 pub const VIEWER_SECRET: &str = "viewer-test-secret";
 pub const NOW: u64 = 1_700_000_000;
 
+/// R2 の代わり (キー → 本体)。`fail_get` で失敗させる。無いキーは `missing` の失敗 (worker の `R2Store` と同じ)
+#[derive(Default)]
+pub struct MockStore {
+    pub objects: StdMutex<HashMap<String, Vec<u8>>>,
+    pub fail_get: AtomicBool,
+}
+
+impl MockStore {
+    pub fn insert(&self, key: &str, bytes: &[u8]) {
+        self.objects
+            .lock()
+            .unwrap()
+            .insert(key.to_owned(), bytes.to_vec());
+    }
+}
+
+impl FileStore for MockStore {
+    fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Vec<u8>, StoreError>> {
+        Box::pin(async move {
+            if self.fail_get.load(Ordering::SeqCst) {
+                return Err(StoreError("get"));
+            }
+            self.objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or(StoreError("missing"))
+        })
+    }
+}
+
 /// [`build_with`] の差し替え
 pub struct Options {
     pub sso_key: Option<&'static str>,
@@ -515,6 +549,8 @@ pub struct Options {
     pub viewer_secret: Option<&'static str>,
     /// Cloudflare Email Routing の token・account ID が在るか
     pub email_routing_configured: bool,
+    /// R2 の binding `NOTIFY_R2` が在るか
+    pub files_configured: bool,
 }
 
 impl Default for Options {
@@ -524,6 +560,7 @@ impl Default for Options {
             frontend_url: Some(FRONTEND_URL),
             viewer_secret: Some(VIEWER_SECRET),
             email_routing_configured: true,
+            files_configured: true,
         }
     }
 }
@@ -535,6 +572,7 @@ pub struct App {
     pub http: Arc<MockHttp>,
     pub email: Arc<MockEmailRouting>,
     pub line_tokens: Arc<LineTokenCache>,
+    pub files: Arc<MockStore>,
 }
 
 impl App {
@@ -572,6 +610,7 @@ pub fn build_with(pg: PgClient, opts: Options) -> App {
     let http = Arc::new(MockHttp::default());
     let email = Arc::new(MockEmailRouting::new(opts.email_routing_configured));
     let line_tokens = Arc::new(LineTokenCache::default());
+    let files = Arc::new(MockStore::default());
     let state = NotifyState {
         pg: Arc::new(Mutex::new(pg)),
         lineworks: lineworks.clone(),
@@ -589,6 +628,7 @@ pub fn build_with(pg: PgClient, opts: Options) -> App {
             viewer_secret: opts.viewer_secret.map(Arc::from),
             now: Arc::new(|| NOW),
         },
+        files: opts.files_configured.then(|| files.clone() as SharedStore),
         log: Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_owned())),
     };
     App {
@@ -598,6 +638,7 @@ pub fn build_with(pg: PgClient, opts: Options) -> App {
         http,
         email,
         line_tokens,
+        files,
     }
 }
 
@@ -612,6 +653,7 @@ pub async fn broken_app() -> App {
 
 pub struct Got {
     pub status: u16,
+    pub headers: HeaderMap,
     pub body: Vec<u8>,
 }
 
@@ -672,9 +714,14 @@ pub async fn call_with(
         .await
         .unwrap();
     let status = resp.status().as_u16();
+    let headers = resp.headers().clone();
     let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap()
         .to_vec();
-    Got { status, body }
+    Got {
+        status,
+        headers,
+        body,
+    }
 }

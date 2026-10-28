@@ -5,8 +5,8 @@
 #   NOTIFY_TEST_ADMIN_DATABASE_URL=... cargo llvm-cov --locked -p notify --text > cov-notify.txt
 #   bash scripts/check_coverage_100.sh --use-cache cov-notify.txt
 #
-# 計測するのは `cargo test -p notify` の全部 = 単体テストと tests/recipients_db.rs・tests/lineworks_db.rs・tests/distribute_db.rs・tests/inbound_db.rs (口から実 DB まで。接続先が無ければ失敗する。
-# lineworks-worker・LINE・viewer はモック)。
+# 計測するのは `cargo test -p notify` の全部 = 単体テストと tests/recipients_db.rs・tests/lineworks_db.rs・tests/distribute_db.rs・tests/inbound_db.rs・tests/documents_db.rs (口から実 DB まで。接続先が無ければ失敗する。
+# lineworks-worker・LINE・viewer・R2 はモック)。
 # worker 本体 (直下の src/、wasm 専用) は native で計測できないので対象外。
 
 # tenant の layer と DB の失敗の応答・ログ
@@ -64,3 +64,11 @@ path = "crates/notify/src/line_webhook.rs"
 # LINE WORKS の webhook の受け口 (bot-secret・event。tests/inbound_db.rs が実 DB で通す)
 [[files]]
 path = "crates/notify/src/lineworks_webhook.rs"
+
+# 文書とメールの閲覧の口 (一覧・1 件・preview・download・メール。tests/documents_db.rs が実 DB で通す。R2 はモック)
+[[files]]
+path = "crates/notify/src/documents.rs"
+
+# 文書のファイルの置き場 (trait) と Content-Disposition
+[[files]]
+path = "crates/notify/src/store.rs"
