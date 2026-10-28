@@ -23,6 +23,7 @@ use futures_util::lock::Mutex;
 use notify::distribute::Outbound;
 use notify::email_routing::{EmailRoutingApi, ErMethod, ErRequest, ErResponse, ErUnreachable};
 use notify::http::{Http, HttpError, HttpRequest, HttpResponse};
+use notify::jobs::{Job, JobQueue, QueueError};
 use notify::line::{LineEndpoints, LineTokenCache};
 use notify::lineworks::{LineworksApi, LwRequest, LwResponse, LwUnreachable};
 use notify::store::{FileStore, SharedStore, StoreError};
@@ -514,7 +515,10 @@ pub const NOW: u64 = 1_700_000_000;
 #[derive(Default)]
 pub struct MockStore {
     pub objects: StdMutex<HashMap<String, Vec<u8>>>,
+    /// put の (キー, content_type)
+    pub puts: StdMutex<Vec<(String, String)>>,
     pub fail_get: AtomicBool,
+    pub fail_put: AtomicBool,
 }
 
 impl MockStore {
@@ -538,6 +542,50 @@ impl FileStore for MockStore {
                 .get(key)
                 .cloned()
                 .ok_or(StoreError("missing"))
+        })
+    }
+
+    fn put<'a>(
+        &'a self,
+        key: &'a str,
+        bytes: Vec<u8>,
+        content_type: &'a str,
+    ) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async move {
+            if self.fail_put.load(Ordering::SeqCst) {
+                return Err(StoreError("put"));
+            }
+            self.puts
+                .lock()
+                .unwrap()
+                .push((key.to_owned(), content_type.to_owned()));
+            self.objects.lock().unwrap().insert(key.to_owned(), bytes);
+            Ok(())
+        })
+    }
+}
+
+/// queue の代わり (送ったジョブと遅れを残す)。`fail` で送れなくする
+#[derive(Default)]
+pub struct MockQueue {
+    pub sent: StdMutex<Vec<(Job, u32)>>,
+    pub fail: AtomicBool,
+}
+
+impl MockQueue {
+    pub fn sent(&self) -> Vec<(Job, u32)> {
+        self.sent.lock().unwrap().clone()
+    }
+}
+
+impl JobQueue for MockQueue {
+    fn send(&self, job: Job, delay_secs: u32) -> BoxFuture<'_, Result<(), QueueError>> {
+        Box::pin(async move {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(QueueError);
+            }
+            self.sent.lock().unwrap().push((job, delay_secs));
+            Ok(())
         })
     }
 }
@@ -573,6 +621,7 @@ pub struct App {
     pub email: Arc<MockEmailRouting>,
     pub line_tokens: Arc<LineTokenCache>,
     pub files: Arc<MockStore>,
+    pub jobs: Arc<MockQueue>,
 }
 
 impl App {
@@ -611,6 +660,7 @@ pub fn build_with(pg: PgClient, opts: Options) -> App {
     let email = Arc::new(MockEmailRouting::new(opts.email_routing_configured));
     let line_tokens = Arc::new(LineTokenCache::default());
     let files = Arc::new(MockStore::default());
+    let jobs = Arc::new(MockQueue::default());
     let state = NotifyState {
         pg: Arc::new(Mutex::new(pg)),
         lineworks: lineworks.clone(),
@@ -629,6 +679,7 @@ pub fn build_with(pg: PgClient, opts: Options) -> App {
             now: Arc::new(|| NOW),
         },
         files: opts.files_configured.then(|| files.clone() as SharedStore),
+        jobs: jobs.clone(),
         log: Arc::new(move |m: &str| sink.lock().unwrap().push(m.to_owned())),
     };
     App {
@@ -639,6 +690,7 @@ pub fn build_with(pg: PgClient, opts: Options) -> App {
         email,
         line_tokens,
         files,
+        jobs,
     }
 }
 

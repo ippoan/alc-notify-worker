@@ -17,6 +17,9 @@
 #     (この worker は Durable Object も Container も持たない)
 #   - env 配下 (env.staging を含む) の r2_buckets が本番の bucket (トップレベルの r2_buckets の bucket_name) を指さない
 #     (本番の文書のファイルを読む)
+#   - env 配下 (env.staging を含む) の queues (producers・consumers) が本番の queue を、services (ALC_REDACT・
+#     NOTIFY_REALTIME_BUS) が本番の service を、NOTIFY_REDACT_BROADCAST_SECRET が本番の secret を指さない
+#     (staging の文書の処理が本番の queue・auth-worker・WS へ流れる。W8c-2)
 #   - env 配下 (env.staging を含む) に hyperdrive が無い (ippoan/rust-alc-api#723)。Hyperdrive の binding は本番の DB へ
 #     届くので、トップレベル (本番) にだけ置く (staging に置かない)
 # 違えば exit 1。CI で毎回走らせる。陰性対照は scripts/check-exposure-test.sh。
@@ -85,6 +88,24 @@ for name, e in envs.items():
     for b in e.get("r2_buckets", []):
         if b.get("bucket_name") in prod_buckets:
             err(f"env.{name} の r2_buckets が本番の bucket {b['bucket_name']} を指している (env 用の bucket を指すこと)")
+
+# 本番の queue・service・broadcast の secret を env 配下から指さない (W8c-2)
+queues = cfg.get("queues", {})
+prod_queues = {q.get("queue") for k in ("producers", "consumers") for q in queues.get(k, [])}
+pinned = ("ALC_REDACT", "NOTIFY_REALTIME_BUS")
+prod_services = {s.get("binding"): s.get("service") for s in cfg.get("services", []) if s.get("binding") in pinned}
+prod_secret = {s.get("secret_name") for s in cfg.get("secrets_store_secrets", []) if s.get("binding") == "NOTIFY_REDACT_BROADCAST_SECRET"}
+for name, e in envs.items():
+    for k in ("producers", "consumers"):
+        for q in e.get("queues", {}).get(k, []):
+            if q.get("queue") in prod_queues:
+                err(f"env.{name} の queues.{k} が本番の queue {q['queue']} を指している (env 用の queue を指すこと)")
+    for svc in e.get("services", []):
+        if svc.get("binding") in prod_services and svc.get("service") == prod_services[svc.get("binding")]:
+            err(f"env.{name} の services {svc['binding']} が本番の {svc['service']} を指している")
+    for sec in e.get("secrets_store_secrets", []):
+        if sec.get("binding") == "NOTIFY_REDACT_BROADCAST_SECRET" and sec.get("secret_name") in prod_secret:
+            err(f"env.{name} の NOTIFY_REDACT_BROADCAST_SECRET が本番の secret を指している")
 
 if errors:
     sys.exit(1)

@@ -28,7 +28,7 @@ jobs:
   notify-worker:
     name: Notify Worker (wasm)
     runs-on: ubuntu-latest
-    # 実 DB のテスト (crates/notify/tests/recipients_db.rs・lineworks_db.rs・distribute_db.rs・inbound_db.rs・documents_db.rs) の接続先。runner の中の使い捨ての DB
+    # 実 DB のテスト (crates/notify/tests/recipients_db.rs・lineworks_db.rs・distribute_db.rs・inbound_db.rs・documents_db.rs・background_db.rs) の接続先。runner の中の使い捨ての DB
     services:
       postgres:
         image: postgres:17
@@ -61,10 +61,10 @@ jobs:
       # テストの準備が流す SQL を ippoan/alc-migrations から取る (版は scripts/ALC_MIGRATIONS_REV)
       - run: bash scripts/fetch-migrations.sh
       - uses: taiki-e/install-action@cargo-llvm-cov
-      # tests/recipients_db.rs・lineworks_db.rs・distribute_db.rs・inbound_db.rs・documents_db.rs (口から実 DB まで) と単体テストを計測つきで 1 回だけ走らせる。
+      # tests/recipients_db.rs・lineworks_db.rs・distribute_db.rs・inbound_db.rs・documents_db.rs・background_db.rs (口から実 DB まで) と単体テストを計測つきで 1 回だけ走らせる。
       # テストの target ごとに本数を固定する (減ったら落ちる。テストを足したらここの数も上げる)。
       # 接続文字列は runner の中の使い捨ての DB のもので、secret ではない。
-      - name: recipients_db + lineworks_db + distribute_db + inbound_db + documents_db + Coverage 100% gate
+      - name: recipients_db + lineworks_db + distribute_db + inbound_db + documents_db + background_db + Coverage 100% gate
         env:
           NOTIFY_TEST_ADMIN_DATABASE_URL: postgresql://postgres:test@localhost:5432/postgres
           CARGO_TERM_COLOR: never
@@ -84,6 +84,8 @@ jobs:
             | grep -Eq '^test result: ok\. 9 passed; 0 failed; 0 ignored'
           awk '/Running tests\/documents_db\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/notify-test.txt" \
             | grep -Eq '^test result: ok\. 9 passed; 0 failed; 0 ignored'
+          awk '/Running tests\/background_db\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/notify-test.txt" \
+            | grep -Eq '^test result: ok\. 12 passed; 0 failed; 0 ignored'
           # -p を付けないと直下の package (worker) だけが対象になり、報告が空になる
           cargo llvm-cov report --locked -p notify --text > "$RUNNER_TEMP/notify-cov.txt"
           bash scripts/check_coverage_100.sh --use-cache "$RUNNER_TEMP/notify-cov.txt"

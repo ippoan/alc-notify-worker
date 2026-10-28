@@ -9,17 +9,25 @@
 //! 秘密値 `SSO_ENCRYPTION_KEY` (Secrets Store) は line-config の POST・LINE の webhook・配信の口でだけ、`INTERNAL_SHARED_SECRET`
 //! (Secrets Store、viewer の register-view の認証) は配信の口でだけ引く。`CF_EMAIL_ROUTING_TOKEN` (Secrets Store) と
 //! `CF_ACCOUNT_ID` (`[vars]`) (Cloudflare Email Routing の送り先の登録) は宛先の保存と email-status の口でだけ引く ([`email_routing`])。配信の外への POST (LINE・viewer) は [`http`]。
-//! 文書のファイル (閲覧の preview・download) は R2 の binding `NOTIFY_R2` ([`r2`])。
+//! 文書のファイル (閲覧の preview・download と黒塗りの JPEG) は R2 の binding `NOTIFY_R2` ([`r2`])。
+//!
+//! 抽出・黒塗り (W8c-2) は Cloudflare Queues の binding `NOTIFY_DOCS_QUEUE` へ積み ([`queue`])、同じ worker の
+//! `#[event(queue)]` が 1 メッセージずつ [`notify::background::Background::run`] に渡す。alc-redact は auth-worker の RPC
+//! `AlcRedactEntrypoint` ([`redact`])、終わりの WS の push は notify-realtime-bus の Service Binding ([`bus`]。
+//! `X-Broadcast-Secret` は Secrets Store の `NOTIFY_REDACT_BROADCAST_SECRET`。consumer でだけ引く)。
 
 // worker 本体は wasm32 専用。native の `cargo build` / `clippy` / `test` (workspace の root で打つもの) では空の crate にして、
 // crates/notify だけを検査させる
 #![cfg(target_arch = "wasm32")]
 
+mod bus;
 mod db;
 mod email_routing;
 mod http;
 mod lineworks;
+mod queue;
 mod r2;
+mod redact;
 mod tcp;
 
 use std::sync::{Arc, OnceLock};
@@ -27,8 +35,10 @@ use std::sync::{Arc, OnceLock};
 use axum::body::Body;
 use axum::http::{HeaderValue, Method, Response, StatusCode};
 use futures_util::lock::Mutex;
+use notify::background::{Background, Broadcaster, Outcome};
 use notify::distribute::{is_distribute_request, Outbound};
 use notify::email_routing::{needs_email_routing, EmailRoutingApi};
+use notify::jobs::{Job, SharedQueue};
 use notify::line::{LineEndpoints, LineTokenCache};
 use notify::line_config::LINE_CONFIG_PATH;
 use notify::line_webhook::LINE_WEBHOOK_PATH;
@@ -37,13 +47,17 @@ use notify::store::SharedStore;
 use notify::{router, LogSink, NotifyState};
 use tower_service::Service;
 use worker::{
-    console_error, event, Context, Date, Env, HttpRequest, Result, WorkerVersionMetadata,
+    console_error, event, Context, Date, Env, HttpRequest, MessageBatch, MessageExt, Result,
+    WorkerVersionMetadata,
 };
 
+use crate::bus::BusBinding;
 use crate::email_routing::{CloudflareEmailRouting, NoEmailRouting};
 use crate::http::WorkerHttp;
 use crate::lineworks::{LineworksBinding, NoLineworks};
+use crate::queue::{NoQueue, QueueBinding};
 use crate::r2::R2Store;
+use crate::redact::{NoRedact, RedactBinding};
 
 /// line-config の秘密値の暗号化の鍵 (Secrets Store。auth-worker・alc-lineworks-worker と同じ secret)。LINE の webhook の
 /// 署名の照合 (channel secret の復号) にも使う
@@ -63,6 +77,15 @@ const CF_ACCOUNT_ID_BINDING: &str = "CF_ACCOUNT_ID";
 /// 文書のファイルの R2 の binding (wrangler.toml の `[[r2_buckets]]`。本番と staging で別の bucket)。
 /// 無ければ preview は 503・download は 500 (rust の storage 無しと同じ)
 const NOTIFY_R2_BINDING: &str = "NOTIFY_R2";
+
+/// 抽出・黒塗りの queue の producer (wrangler.toml の `[[queues.producers]]`。本番 `notify-docs`・staging `notify-docs-staging`)
+const NOTIFY_DOCS_QUEUE_BINDING: &str = "NOTIFY_DOCS_QUEUE";
+/// auth-worker の named entrypoint `AlcRedactEntrypoint` (alc-redact の黒塗りと抽出)
+const ALC_REDACT_BINDING: &str = "ALC_REDACT";
+/// nuxt-notify の notify-realtime-bus (黒塗りの終わりの WS の push)
+const NOTIFY_REALTIME_BUS_BINDING: &str = "NOTIFY_REALTIME_BUS";
+/// realtime-bus の `/broadcast` の認証 (Secrets Store。realtime-bus と同じ secret)
+const NOTIFY_REDACT_BROADCAST_SECRET_BINDING: &str = "NOTIFY_REDACT_BROADCAST_SECRET";
 
 /// LINE の channel access token の置き場 (isolate の間ずっと持つ。キーは channel ごと)
 fn line_tokens() -> Arc<LineTokenCache> {
@@ -118,6 +141,20 @@ fn files(env: &Env) -> Option<SharedStore> {
     env.bucket(NOTIFY_R2_BINDING)
         .ok()
         .map(|b| Arc::new(R2Store::new(b)) as SharedStore)
+}
+
+fn jobs(env: &Env) -> SharedQueue {
+    match env.queue(NOTIFY_DOCS_QUEUE_BINDING) {
+        Ok(q) => Arc::new(QueueBinding::new(q)),
+        Err(_) => Arc::new(NoQueue),
+    }
+}
+
+/// realtime-bus の binding と secret が両方あるときだけ push する
+async fn bus(env: &Env) -> Option<Arc<dyn Broadcaster>> {
+    let fetcher = env.service(NOTIFY_REALTIME_BUS_BINDING).ok()?;
+    let secret = secret(env, NOTIFY_REDACT_BROADCAST_SECRET_BINDING).await?;
+    Some(Arc::new(BusBinding::new(fetcher, secret)))
 }
 
 fn log_sink() -> LogSink {
@@ -185,6 +222,7 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
         sso_key,
         outbound,
         files: files(&env),
+        jobs: jobs(&env),
         log: log_sink(),
     };
     let mut resp = match router().with_state(state).call(req).await {
@@ -204,4 +242,43 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
         }
     }
     Ok(resp)
+}
+
+/// 抽出・黒塗りの consumer (wrangler.toml の `[[queues.consumers]]`、max_batch_size = 1)。1 メッセージずつ処理し、
+/// 一時的な失敗は attempt を進めて送り直してから ack する (送れなければ Queues の retry)。DB に繋げなければバッチごと retry
+#[event(queue)]
+async fn queue(batch: MessageBatch<Job>, env: Env, _ctx: Context) -> Result<()> {
+    let pg = match db::connect(&env).await {
+        Ok(c) => c,
+        Err(e) => {
+            console_error!("notify: queue: {e}");
+            batch.retry_all();
+            return Ok(());
+        }
+    };
+    let background = Background {
+        pg: Arc::new(Mutex::new(pg)),
+        files: files(&env),
+        redact: match env.service(ALC_REDACT_BINDING) {
+            Ok(f) => Arc::new(RedactBinding::new(f)),
+            Err(_) => Arc::new(NoRedact),
+        },
+        bus: bus(&env).await,
+        log: log_sink(),
+        now_ms: Arc::new(|| Date::now().as_millis()),
+    };
+    let requeue = jobs(&env);
+    for message in batch.messages()? {
+        match background.run(message.body().clone()).await {
+            Outcome::Ack => message.ack(),
+            Outcome::Requeue { job, delay_secs } => match requeue.send(job, delay_secs).await {
+                Ok(()) => message.ack(),
+                Err(_) => {
+                    console_error!("notify: queue: requeue failed");
+                    message.retry();
+                }
+            },
+        }
+    }
+    Ok(())
 }

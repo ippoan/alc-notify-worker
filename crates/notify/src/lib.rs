@@ -14,7 +14,10 @@
 //! - [`lineworks_webhook`] — LINE WORKS の webhook の受け口 (`GET /api/internal/lineworks/bot-secret/{bot_id}`・
 //!   `POST /api/internal/lineworks/event`。auth-worker の Durable Object が呼ぶ)
 //! - [`documents`] — 文書とメールの閲覧 (`GET /api/notify/documents`・`/{id}`・`/{id}/preview`・`/{id}/download`・
-//!   `GET /api/notify/emails`・`/{message_id}`)。ファイルは R2 ([`store::FileStore`])。書きの口は Cloud Run に残る
+//!   `GET /api/notify/emails`・`/{message_id}`)。ファイルは R2 ([`store::FileStore`])。upload・DELETE は Cloud Run に残る (W8c-2 の PR-3b で移す)
+//! - [`recompute`] — 抽出・黒塗りのやり直し (`POST /api/notify/documents/{id}/redact-recompute`・`/extract-recompute`。
+//!   Cloudflare Queues へ積む [`jobs`])
+//! - [`background`] — 抽出と黒塗りの背景処理 (Queues の consumer。alc-redact を auth-worker の RPC 越しに呼ぶ)
 //! - [`pg`] — SQL (`PgClient::tenant_tx` + `query_typed` 系だけ)
 //!
 //! path・method・JSON の形・status は rust と同じ (nuxt-notify と auth-worker がそのまま使う)。path の頭の `/api` は、
@@ -26,12 +29,14 @@
 //!
 //! 失敗の応答は rust と同じ (宛先・グループ・line-config は本文なしの status、LINE WORKS の口は `{"error": ...}`)。ログは固定の語と DB のエラーの kind だけ (識別子・入力の値を出さない)。
 
+pub mod background;
 pub mod channels;
 pub mod distribute;
 pub mod documents;
 pub mod email_routing;
 pub mod groups;
 pub mod http;
+pub mod jobs;
 pub mod line;
 pub mod line_config;
 pub mod line_webhook;
@@ -39,6 +44,7 @@ pub mod lineworks;
 pub mod lineworks_webhook;
 pub mod pg;
 pub mod recipients;
+pub mod recompute;
 pub mod store;
 pub mod viewer_register;
 
@@ -51,6 +57,7 @@ use axum::{middleware, Router};
 use distribute::Outbound;
 use email_routing::EmailRoutingApi;
 use futures_util::lock::Mutex;
+use jobs::SharedQueue;
 use lineworks::LineworksApi;
 use store::SharedStore;
 
@@ -69,6 +76,8 @@ pub struct NotifyState {
     pub outbound: Outbound,
     /// 文書のファイル (R2 の binding `NOTIFY_R2`)。無ければ preview は 503・download は 500 (rust の storage 無しと同じ)
     pub files: Option<SharedStore>,
+    /// 抽出・黒塗りの queue (binding `NOTIFY_DOCS_QUEUE`)。無ければ送れずに 500
+    pub jobs: SharedQueue,
     pub log: LogSink,
 }
 
@@ -97,6 +106,7 @@ pub fn router() -> Router<NotifyState> {
         .merge(lineworks::router())
         .merge(distribute::router())
         .merge(documents::router())
+        .merge(recompute::router())
         .route_layer(middleware::from_fn(require_tenant_header))
         .merge(line_webhook::router())
         .merge(lineworks_webhook::router())
