@@ -187,6 +187,10 @@ impl FileStore for Store {
             Ok(())
         })
     }
+
+    fn delete<'a>(&'a self, _: &'a str) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// alc-redact (auth-worker の RPC) の代わり。応答を順に返す (尽きたら 200 の既定)

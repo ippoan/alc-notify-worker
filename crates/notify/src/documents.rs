@@ -8,7 +8,10 @@
 //! - `GET /api/notify/emails` — メール (`email_message_id`) ごとの一覧 (新しい順に 200 件)
 //! - `GET /api/notify/emails/{message_id}` — メールの見出しと添付。添付が無ければ 404
 //!
-//! 書きの口 (upload・DELETE・redact-recompute・extract-recompute・ingest) は Cloud Run に残る (W8c-2)。
+//! - `DELETE /api/notify/documents/{id}` — 文書を消す (W8c-2 PR-3b。rust の `email_documents.rs` の delete。配信の記録は
+//!   ON DELETE CASCADE)。無ければ 404、消したら R2 の原本も消す (失敗はログだけ。R2 の binding が無ければ消さない)。204
+//!
+//! upload・取り込みは [`crate::intake`]、やり直しは [`crate::recompute`]。
 //!
 //! rust との違い (ファイルの口だけ):
 //! - `Content-Disposition` は ASCII だけで組む ([`content_disposition`])
@@ -44,7 +47,7 @@ const DEFAULT_FILE_NAME: &str = "attachment";
 pub fn router() -> Router<NotifyState> {
     Router::new()
         .route(DOCUMENTS_PATH, get(list))
-        .route(DOCUMENT_PATH, get(get_one))
+        .route(DOCUMENT_PATH, get(get_one).delete(delete_one))
         .route(PREVIEW_PATH, get(preview))
         .route(DOWNLOAD_PATH, get(download))
         .route(EMAILS_PATH, get(list_emails))
@@ -271,6 +274,27 @@ impl NotifyState {
         (self.log)(&format!("notify: {what} failed: r2 ({})", e.0));
         StatusCode::INTERNAL_SERVER_ERROR
     }
+}
+
+async fn delete_one(
+    State(state): State<NotifyState>,
+    Extension(TenantId(tenant_id)): Extension<TenantId>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, StatusCode> {
+    let deleted = {
+        let mut pg = state.pg.lock().await;
+        pg::delete_document(&mut pg, tenant_id, id).await
+    };
+    let r2_key = deleted
+        .map_err(|e| state.db_fail("delete_document", &e))?
+        .ok_or(StatusCode::NOT_FOUND)?;
+    // R2 は best-effort (rust と同じ。残っても行が無いので届かない)
+    if let Some(files) = &state.files {
+        if files.delete(&r2_key).await.is_err() {
+            (state.log)("notify: delete_document r2 delete failed");
+        }
+    }
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]

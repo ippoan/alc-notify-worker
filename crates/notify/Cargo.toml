@@ -12,7 +12,8 @@ alc-core-wasm = { workspace = true }
 # line-config の秘密値の暗号化 (rust の `alc_core::auth_lineworks::encrypt_secret` と同じ形式)
 alc-worker-crypto = { workspace = true }
 alc-worker-db = { workspace = true }
-axum = { version = "0.8", default-features = false, features = ["json", "query"] }
+# multipart は upload の口 (rust と同じ axum の Multipart。multer は pure Rust で wasm32 でもビルドできる。ippoan/alc-trouble-worker と同じ)
+axum = { version = "0.8", default-features = false, features = ["json", "multipart", "query"] }
 # LINE の webhook の署名 (`base64(HMAC-SHA256(body))`。rust の line_webhook.rs と同じ crate と版)
 base64 = "0.22"
 hmac = "0.12"

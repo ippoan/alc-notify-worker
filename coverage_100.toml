@@ -84,3 +84,7 @@ path = "crates/notify/src/recompute.rs"
 # queue のジョブの形
 [[files]]
 path = "crates/notify/src/jobs.rs"
+
+# 文書の upload とメールの取り込み (tests/intake_db.rs が実 DB で通す。R2・queue はモック)
+[[files]]
+path = "crates/notify/src/intake.rs"

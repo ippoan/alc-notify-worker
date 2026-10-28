@@ -1,5 +1,5 @@
 //! 文書のファイルの置き場 (Worker では R2 の binding `NOTIFY_R2`、テストではモック) と、取り出しの口の `Content-Disposition`
-//! (ippoan/alc-carins-worker の `store.rs` の `FileStore`・`content_disposition` の写し)。読みの `get` と、黒塗りの JPEG を置く `put`。
+//! (ippoan/alc-carins-worker の `store.rs` の `FileStore`・`content_disposition` の写し)。読みの `get`、upload・取り込み・黒塗りの JPEG を置く `put`、文書の削除の `delete`。
 
 use std::sync::Arc;
 
@@ -21,6 +21,9 @@ pub trait FileStore: Send + Sync {
         bytes: Vec<u8>,
         content_type: &'a str,
     ) -> BoxFuture<'a, Result<(), StoreError>>;
+
+    /// 消す (無いキーも成功。呼び手は失敗をログだけにする)
+    fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), StoreError>>;
 }
 
 pub type SharedStore = Arc<dyn FileStore>;

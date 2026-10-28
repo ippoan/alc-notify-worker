@@ -1,5 +1,5 @@
 //! 文書のファイルの置き場 ([`notify::store::FileStore`]) の Workers での実装: R2 の binding `NOTIFY_R2`
-//! (ippoan/alc-trouble-worker の `src/r2.rs` の型。読みの `get` と、黒塗りの JPEG を置く `put` (`httpMetadata.contentType` 付き))。
+//! (ippoan/alc-trouble-worker の `src/r2.rs` の型。読みの `get`、upload・取り込み・黒塗りの JPEG を置く `put` (`httpMetadata.contentType` 付き)、削除の `delete`)。
 //!
 //! `FileStore` は `Send + Sync` で `Send` な future を返す (axum の state と handler が要求する)。
 //! R2 の値と future は JS の値で `Send` でないので、`worker::send` の `SendWrapper`・`SendFuture` で包む
@@ -52,6 +52,12 @@ impl FileStore for R2Store {
                 .execute()
                 .await;
             put.map(|_| ()).map_err(|_| StoreError("put"))
+        }))
+    }
+
+    fn delete<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<(), StoreError>> {
+        Box::pin(SendFuture::new(async move {
+            self.0.delete(key).await.map_err(|_| StoreError("delete"))
         }))
     }
 }
