@@ -1,4 +1,4 @@
-//! 外への POST (LINE の Messaging API・viewer の register-view) の口。worker は `worker::Fetch`
+//! 外への POST (LINE の Messaging API・viewer の register-view) と GET (LINE の profile) の口。worker は `worker::Fetch`
 //! (直下の `src/http.rs`)、テストはモックに差し替える。
 //!
 //! **redirect は辿らない** (3xx はそのまま応答として返し、呼び手が 2xx 以外を失敗にする)。rust の viewer 登録が
@@ -30,6 +30,13 @@ pub struct HttpError;
 
 pub trait Http: Send + Sync {
     fn post(&self, req: HttpRequest) -> BoxFuture<'_, Result<HttpResponse, HttpError>>;
+
+    /// 本文なしの GET (`headers` は `Authorization` など)
+    fn get(
+        &self,
+        url: String,
+        headers: Vec<(&'static str, String)>,
+    ) -> BoxFuture<'_, Result<HttpResponse, HttpError>>;
 }
 
 impl HttpResponse {
@@ -80,6 +87,19 @@ pub(crate) mod fake {
                 body: b"{}".to_vec(),
             }));
             Box::pin(async move { reply })
+        }
+
+        fn get(
+            &self,
+            url: String,
+            headers: Vec<(&'static str, String)>,
+        ) -> BoxFuture<'_, Result<HttpResponse, HttpError>> {
+            self.post(HttpRequest {
+                url,
+                content_type: "",
+                headers,
+                body: Vec::new(),
+            })
         }
     }
 }

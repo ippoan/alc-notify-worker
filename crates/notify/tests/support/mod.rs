@@ -393,8 +393,8 @@ impl EmailRoutingApi for MockEmailRouting {
 /// [`MockHttp`] の規則 (URL の頭, 本文に含む文字列, 応答)
 type HttpRule = (String, Option<String>, Result<HttpResponse, HttpError>);
 
-/// 外への POST (LINE・viewer の register-view) のモック。受けたリクエストを残し、URL に合う規則の応答を返す
-/// (後から足した規則を先に見る。合わなければ 200 `{}`)
+/// 外への POST (LINE・viewer の register-view) と GET (LINE の profile) のモック。受けたリクエストを残し、URL に合う規則の
+/// 応答を返す (後から足した規則を先に見る。合わなければ 200 `{}`)。GET は `content_type` を空・本文を空にして残す
 #[derive(Default)]
 pub struct MockHttp {
     pub calls: StdMutex<Vec<HttpRequest>>,
@@ -482,6 +482,19 @@ impl Http for MockHttp {
             reply
         })
     }
+
+    fn get(
+        &self,
+        url: String,
+        headers: Vec<(&'static str, String)>,
+    ) -> BoxFuture<'_, Result<HttpResponse, HttpError>> {
+        self.post(HttpRequest {
+            url,
+            content_type: "",
+            headers,
+            body: Vec::new(),
+        })
+    }
 }
 
 /// テストの `SSO_ENCRYPTION_KEY` (秘密ではない)
@@ -489,6 +502,7 @@ pub const TEST_SSO_KEY: &str = "notify-test-sso-key";
 /// テストの LINE の口・viewer・`INTERNAL_SHARED_SECRET`・今の時刻 (どれも外へ出ない名目の値)
 pub const LINE_TOKEN_URL: &str = "https://line.test/oauth2/v2.1/token";
 pub const LINE_PUSH_URL: &str = "https://line.test/v2/bot/message/push";
+pub const LINE_PROFILE_URL: &str = "https://line.test/v2/bot/profile/";
 pub const FRONTEND_URL: &str = "https://viewer.test";
 pub const REGISTER_URL: &str = "https://viewer.test/api/notify/register-view";
 pub const VIEWER_SECRET: &str = "viewer-test-secret";
@@ -568,6 +582,7 @@ pub fn build_with(pg: PgClient, opts: Options) -> App {
             line_endpoints: LineEndpoints {
                 token: LINE_TOKEN_URL.to_owned(),
                 push: LINE_PUSH_URL.to_owned(),
+                profile: LINE_PROFILE_URL.to_owned(),
             },
             line_tokens: line_tokens.clone(),
             frontend_url: opts.frontend_url.map(Arc::from),

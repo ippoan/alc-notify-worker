@@ -1,5 +1,6 @@
 //! LINE (Messaging API) への送信。rust-alc-api の `crates/alc-notify/src/clients/line.rs` の移植
-//! (JWT assertion で channel access token v2.1 を取り、push で text / image を送る)。
+//! (JWT assertion で channel access token v2.1 を取り、push で text / image を送る)。follow した利用者の表示名
+//! (profile API) も引く ([`LineClient::display_name`]。rust の `line_webhook.rs` の `get_user_display_name`)。
 //!
 //! - JWT は `alc_worker_crypto::jwt::sign_rs256` に `kid` と rust と同じ claim を渡して組む ([`build_jwt_assertion`])
 //! - channel access token は isolate の中に置く ([`LineTokenCache`]。ippoan/alc-lineworks-worker の token の cache と同じ方式で、
@@ -20,6 +21,8 @@ use crate::http::{Http, HttpRequest};
 
 pub const PROD_TOKEN_ENDPOINT: &str = "https://api.line.me/oauth2/v2.1/token";
 pub const PROD_PUSH_ENDPOINT: &str = "https://api.line.me/v2/bot/message/push";
+/// 末尾に user id を足す
+pub const PROD_PROFILE_ENDPOINT: &str = "https://api.line.me/v2/bot/profile/";
 /// 期限まで残りがこれ以下の token は使わない (rust と同じ 60 秒)
 const TOKEN_EXPIRY_MARGIN_SECS: u64 = 60;
 const CLIENT_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer";
@@ -29,6 +32,8 @@ const CLIENT_ASSERTION_TYPE: &str = "urn:ietf:params:oauth:client-assertion-type
 pub struct LineEndpoints {
     pub token: String,
     pub push: String,
+    /// 末尾に user id を足す
+    pub profile: String,
 }
 
 impl Default for LineEndpoints {
@@ -36,6 +41,7 @@ impl Default for LineEndpoints {
         Self {
             token: PROD_TOKEN_ENDPOINT.to_owned(),
             push: PROD_PUSH_ENDPOINT.to_owned(),
+            profile: PROD_PROFILE_ENDPOINT.to_owned(),
         }
     }
 }
@@ -126,22 +132,30 @@ struct TokenResponse {
     expires_in: u64,
 }
 
-/// `application/x-www-form-urlencoded` (英数字と `-._~` 以外を `%XX` に)
+#[derive(Deserialize)]
+struct Profile {
+    #[serde(rename = "displayName")]
+    display_name: String,
+}
+
+/// 英数字と `-._~` 以外を `%XX` に
+fn percent_encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+/// `application/x-www-form-urlencoded`
 fn form_urlencode(pairs: &[(&str, &str)]) -> String {
-    let enc = |s: &str| {
-        s.bytes()
-            .map(|b| {
-                if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
-                    (b as char).to_string()
-                } else {
-                    format!("%{b:02X}")
-                }
-            })
-            .collect::<String>()
-    };
     pairs
         .iter()
-        .map(|(k, v)| format!("{}={}", enc(k), enc(v)))
+        .map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v)))
         .collect::<Vec<_>>()
         .join("&")
 }
@@ -185,6 +199,26 @@ impl LineClient<'_> {
         self.cache
             .put(key, token.access_token.clone(), self.now + token.expires_in);
         Ok(token.access_token)
+    }
+
+    /// 利用者の表示名 (profile API)。token が取れない・届かない・2xx 以外・読めないときは `None` (呼び手が代わりの名前にする)。
+    /// user id は path に入れるので `%XX` にする
+    pub async fn display_name(&self, config: &LineConfig, user_id: &str) -> Option<String> {
+        let token = self.access_token(config).await.ok()?;
+        let resp = self
+            .http
+            .get(
+                format!("{}{}", self.endpoints.profile, percent_encode(user_id)),
+                vec![("Authorization", format!("Bearer {token}"))],
+            )
+            .await
+            .ok()?;
+        if !resp.is_success() {
+            return None;
+        }
+        serde_json::from_slice::<Profile>(&resp.body)
+            .ok()
+            .map(|p| p.display_name)
     }
 
     /// 1 通を push する
@@ -280,6 +314,7 @@ mod tests {
         LineEndpoints {
             token: "https://line.test/token".into(),
             push: "https://line.test/push".into(),
+            profile: "https://line.test/profile/".into(),
         }
     }
 
@@ -346,6 +381,7 @@ mod tests {
         let e = LineEndpoints::default();
         assert_eq!(e.token, PROD_TOKEN_ENDPOINT);
         assert_eq!(e.push, PROD_PUSH_ENDPOINT);
+        assert_eq!(e.profile, PROD_PROFILE_ENDPOINT);
     }
 
     #[test]
@@ -446,6 +482,39 @@ mod tests {
                 "previewImageUrl": "https://x/p.jpg",
             }]})
         );
+    }
+
+    #[tokio::test]
+    async fn display_name_reads_profile() {
+        let http = FakeHttp::default();
+        token_ok(&http, "tok", 86_400);
+        http.reply(200, r#"{"displayName":"山田","userId":"U1"}"#)
+            .reply(404, "")
+            .reply(200, "not json")
+            .fail();
+        let (e, cache) = (endpoints(), LineTokenCache::default());
+        let c = client(&http, &e, &cache);
+        let cfg = config("c");
+        assert_eq!(c.display_name(&cfg, "U1").await.as_deref(), Some("山田"));
+        assert_eq!(c.display_name(&cfg, "U/2?x").await, None);
+        assert_eq!(c.display_name(&cfg, "U3").await, None);
+        assert_eq!(c.display_name(&cfg, "U4").await, None);
+        let calls = http.calls();
+        assert_eq!(calls[1].url, "https://line.test/profile/U1");
+        assert_eq!(calls[1].content_type, "");
+        assert!(calls[1].body.is_empty());
+        assert_eq!(
+            calls[1].headers,
+            vec![("Authorization", "Bearer tok".to_owned())]
+        );
+        assert_eq!(calls[2].url, "https://line.test/profile/U%2F2%3Fx");
+        // token が取れなければ profile を引かない
+        let http = FakeHttp::default();
+        http.reply(500, "");
+        let cache = LineTokenCache::default();
+        let c = client(&http, &e, &cache);
+        assert_eq!(c.display_name(&cfg, "U").await, None);
+        assert_eq!(http.calls().len(), 1);
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 //! LINE WORKS の Bot が招かれたトークルーム (lineworks_channels) の口。rust-alc-api の
 //! `crates/alc-notify/src/lineworks_channels.rs` の tenant 側 3 本と同じ path・method・JSON・status
-//! (internal 側の bot-secret / event / send は Cloud Run に残す)。
+//! (internal 側の bot-secret / event は [`crate::lineworks_webhook`]、send は ippoan/alc-lineworks-worker)。
 //!
 //! | method | path | 成功 | 失敗 |
 //! |---|---|---|---|
