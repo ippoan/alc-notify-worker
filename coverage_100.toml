@@ -72,3 +72,15 @@ path = "crates/notify/src/documents.rs"
 # 文書のファイルの置き場 (trait) と Content-Disposition
 [[files]]
 path = "crates/notify/src/store.rs"
+
+# 抽出と黒塗りの背景処理 (Queues の consumer。tests/background_db.rs が実 DB で通す。R2・alc-redact・realtime-bus はモック)
+[[files]]
+path = "crates/notify/src/background.rs"
+
+# 抽出・黒塗りのやり直しの口 (tests/background_db.rs。queue はモック)
+[[files]]
+path = "crates/notify/src/recompute.rs"
+
+# queue のジョブの形
+[[files]]
+path = "crates/notify/src/jobs.rs"

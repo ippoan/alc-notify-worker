@@ -1,5 +1,5 @@
 //! 文書のファイルの置き場 (Worker では R2 の binding `NOTIFY_R2`、テストではモック) と、取り出しの口の `Content-Disposition`
-//! (ippoan/alc-carins-worker の `store.rs` の `FileStore`・`content_disposition` の写し。閲覧の口だけなので読みの `get` だけを持つ)。
+//! (ippoan/alc-carins-worker の `store.rs` の `FileStore`・`content_disposition` の写し)。読みの `get` と、黒塗りの JPEG を置く `put`。
 
 use std::sync::Arc;
 
@@ -13,6 +13,14 @@ pub struct StoreError(pub &'static str);
 pub trait FileStore: Send + Sync {
     /// 無いキーも失敗 (rust の download と同じく 500 にする)
     fn get<'a>(&'a self, key: &'a str) -> BoxFuture<'a, Result<Vec<u8>, StoreError>>;
+
+    /// 上書きで置く (`content_type` は R2 の `httpMetadata.contentType`)
+    fn put<'a>(
+        &'a self,
+        key: &'a str,
+        bytes: Vec<u8>,
+        content_type: &'a str,
+    ) -> BoxFuture<'a, Result<(), StoreError>>;
 }
 
 pub type SharedStore = Arc<dyn FileStore>;

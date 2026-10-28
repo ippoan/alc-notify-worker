@@ -279,6 +279,49 @@ pub mod sql {
          updated_at = NOW() \
          WHERE tenant_id = $2 AND id = $3";
 
+    // ---- 抽出・黒塗りの背景処理と recompute (W8c-2。rust の `repo/notify_documents.rs` の update_extraction・
+    //      update_extraction_error・update_redaction_status・complete_redaction・reset_redaction・reset_extraction) ----
+
+    /// 黒塗りをやり直す前に結果の列を空にして `pending` へ (rust の `reset_redaction`)
+    pub const RESET_REDACTION: &str = "UPDATE notify_documents SET \
+         redacted_r2_key = NULL, redacted_at = NULL, redactions_applied = NULL, \
+         redaction_status = 'pending', redaction_error = NULL, \
+         redact_dl_ms = NULL, redact_llm_ms = NULL, redact_render_ms = NULL, \
+         redact_upload_ms = NULL, redact_total_ms = NULL, updated_at = NOW() \
+         WHERE tenant_id = $1 AND id = $2";
+
+    /// 抽出をやり直す前に `pending` へ (rust の `reset_extraction`)
+    pub const RESET_EXTRACTION: &str = "UPDATE notify_documents SET \
+         extraction_status = 'pending', extraction_error = NULL, updated_at = NOW() \
+         WHERE tenant_id = $1 AND id = $2";
+
+    /// rust の `update_redaction_status` (`processing`・`skipped`・`failed`)
+    pub const UPDATE_REDACTION_STATUS: &str = "UPDATE notify_documents SET \
+         redaction_status = $1, redaction_error = $2, updated_at = NOW() \
+         WHERE tenant_id = $3 AND id = $4";
+
+    /// rust の `complete_redaction`
+    pub const COMPLETE_REDACTION: &str = "UPDATE notify_documents SET \
+         redacted_r2_key = $1, redacted_at = NOW(), redactions_applied = $2, \
+         redaction_status = 'completed', redaction_error = NULL, \
+         redact_dl_ms = $3, redact_llm_ms = $4, redact_render_ms = $5, \
+         redact_upload_ms = $6, redact_total_ms = $7, updated_at = NOW() \
+         WHERE tenant_id = $8 AND id = $9";
+
+    /// rust の `update_extraction` (title・date・summary・phone_numbers は読んだ値を書き戻すだけなので触らない)。
+    /// `$1` は extracted_data の JSON の文字列
+    pub const COMPLETE_EXTRACTION: &str = "UPDATE notify_documents SET \
+         extracted_data = $1::jsonb, extraction_status = 'completed', updated_at = NOW() \
+         WHERE tenant_id = $2 AND id = $3";
+
+    /// rust の `update_extraction_error`
+    pub const FAIL_EXTRACTION: &str = "UPDATE notify_documents SET \
+         extraction_status = 'failed', extraction_error = $1, updated_at = NOW() \
+         WHERE tenant_id = $2 AND id = $3";
+
+    /// 抽出の自社名 (rust の `get_tenant_by_id` の name。tenants に RLS は無い)
+    pub const GET_TENANT_NAME: &str = "SELECT name FROM tenants WHERE id = $1";
+
     pub const CREATE_DELIVERY: &str =
         "INSERT INTO notify_deliveries (tenant_id, document_id, recipient_id, provider) \
          VALUES ($1, $2, $3, $4) RETURNING id, recipient_id, read_token";
@@ -1710,6 +1753,159 @@ pub async fn mark_left_channel(
             )
             .await?;
             Ok(())
+        })
+    })
+    .await
+}
+
+// ---- 抽出・黒塗りの背景処理と recompute (W8c-2) ----
+
+/// `sql` を `(tenant_id, id)` で 1 回流す (reset の 2 つ)
+async fn exec_doc(
+    pg: &mut PgClient,
+    sql: &'static str,
+    tenant_id: Uuid,
+    id: Uuid,
+) -> Result<(), Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            tx.execute_typed(sql, &[(&tenant_id, Type::UUID), (&id, Type::UUID)])
+                .await?;
+            Ok(())
+        })
+    })
+    .await
+}
+
+pub async fn reset_redaction(pg: &mut PgClient, tenant_id: Uuid, id: Uuid) -> Result<(), Error> {
+    exec_doc(pg, sql::RESET_REDACTION, tenant_id, id).await
+}
+
+pub async fn reset_extraction(pg: &mut PgClient, tenant_id: Uuid, id: Uuid) -> Result<(), Error> {
+    exec_doc(pg, sql::RESET_EXTRACTION, tenant_id, id).await
+}
+
+pub async fn update_redaction_status(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    id: Uuid,
+    status: &'static str,
+    error: Option<String>,
+) -> Result<(), Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            tx.execute_typed(
+                sql::UPDATE_REDACTION_STATUS,
+                &[
+                    (&status, Type::TEXT),
+                    (&error, Type::TEXT),
+                    (&tenant_id, Type::UUID),
+                    (&id, Type::UUID),
+                ],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// 黒塗りの段ごとの所要時間 (rust の `RedactTiming`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RedactTiming {
+    pub dl_ms: i32,
+    pub llm_ms: i32,
+    pub render_ms: i32,
+    pub upload_ms: i32,
+    pub total_ms: i32,
+}
+
+pub async fn complete_redaction(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    id: Uuid,
+    redacted_r2_key: String,
+    redactions_applied: i32,
+    t: RedactTiming,
+) -> Result<(), Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            tx.execute_typed(
+                sql::COMPLETE_REDACTION,
+                &[
+                    (&redacted_r2_key, Type::TEXT),
+                    (&redactions_applied, Type::INT4),
+                    (&t.dl_ms, Type::INT4),
+                    (&t.llm_ms, Type::INT4),
+                    (&t.render_ms, Type::INT4),
+                    (&t.upload_ms, Type::INT4),
+                    (&t.total_ms, Type::INT4),
+                    (&tenant_id, Type::UUID),
+                    (&id, Type::UUID),
+                ],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// `extracted_data` を差し替えて `completed` にする
+pub async fn complete_extraction(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    id: Uuid,
+    data: serde_json::Value,
+) -> Result<(), Error> {
+    let data = data.to_string();
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            tx.execute_typed(
+                sql::COMPLETE_EXTRACTION,
+                &[
+                    (&data, Type::TEXT),
+                    (&tenant_id, Type::UUID),
+                    (&id, Type::UUID),
+                ],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+}
+
+pub async fn fail_extraction(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    id: Uuid,
+    error: String,
+) -> Result<(), Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            tx.execute_typed(
+                sql::FAIL_EXTRACTION,
+                &[
+                    (&error, Type::TEXT),
+                    (&tenant_id, Type::UUID),
+                    (&id, Type::UUID),
+                ],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+}
+
+pub async fn get_tenant_name(pg: &mut PgClient, tenant_id: Uuid) -> Result<Option<String>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let row = tx
+                .query_typed_opt(sql::GET_TENANT_NAME, &[(&tenant_id, Type::UUID)])
+                .await?;
+            Ok(row.map(|r| r.get::<_, String>(0)))
         })
     })
     .await

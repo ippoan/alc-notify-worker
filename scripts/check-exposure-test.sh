@@ -66,5 +66,15 @@ mutate "staging の NOTIFY_R2 が本番の bucket notify-files を指す" \
 mutate "staging 以外の env の r2_buckets が本番の bucket を指す" \
   's += "\n[env.other]\nname = \"x\"\nworkers_dev = false\npreview_urls = false\n\n[[env.other.r2_buckets]]\nbinding = \"NOTIFY_R2\"\nbucket_name = \"notify-files\"\n"'
 
+mutate "staging の queue の producer が本番の notify-docs を指す" \
+  's = s.replace("binding = \"NOTIFY_DOCS_QUEUE\"\nqueue = \"notify-docs-staging\"", "binding = \"NOTIFY_DOCS_QUEUE\"\nqueue = \"notify-docs\"", 1)'
+mutate "staging の queue の consumer が本番の notify-docs を読む" \
+  's = s.replace("[[env.staging.queues.consumers]]\nqueue = \"notify-docs-staging\"", "[[env.staging.queues.consumers]]\nqueue = \"notify-docs\"", 1)'
+mutate "staging の ALC_REDACT が本番の auth-worker を指す" \
+  's = s.replace("service = \"auth-worker-staging\"\nentrypoint", "service = \"auth-worker\"\nentrypoint", 1)'
+mutate "staging の NOTIFY_REALTIME_BUS が本番の realtime-bus を指す" \
+  's = s.replace("service = \"notify-realtime-bus-staging\"", "service = \"notify-realtime-bus\"", 1)'
+mutate "staging の broadcast の secret が本番の secret を指す" \
+  's = s.replace("secret_name = \"notify-redact-broadcast-secret-staging\"", "secret_name = \"notify-redact-broadcast-secret\"", 1)'
 
 exit "$fail"

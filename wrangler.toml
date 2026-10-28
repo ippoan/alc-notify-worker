@@ -80,6 +80,38 @@ CF_ACCOUNT_ID = "24b45709d060d957340180e995f0d373"
 binding = "NOTIFY_R2"
 bucket_name = "notify-files"
 
+# 抽出・黒塗りの背景処理 (W8c-2。crates/notify/src/background.rs)。producer は recompute・upload・ingest の口と、
+# 一時的な失敗の送り直し。consumer は同じ worker の #[event(queue)] (src/lib.rs)。1 メッセージずつ (PDF は 25 MiB まで・
+# Gemini の呼び出しは数十秒かかる)。送り直しは本文の attempt で数えるので、Queues の retry は requeue に失敗したときだけ。
+# queue は env に継承されないので staging は下で別の queue を書く (scripts/check-exposure.sh が本番の queue を指さないことを検査)
+[[queues.producers]]
+binding = "NOTIFY_DOCS_QUEUE"
+queue = "notify-docs"
+
+[[queues.consumers]]
+queue = "notify-docs"
+max_batch_size = 1
+max_retries = 3
+
+# alc-redact (GCP Cloud Run) の黒塗りと抽出: auth-worker の named entrypoint AlcRedactEntrypoint の RPC (src/redact.rs)。
+# ID token を作る SA の鍵は auth-worker の 1 か所 (この worker に配らない)。staging は auth-worker-staging
+[[services]]
+binding = "ALC_REDACT"
+service = "auth-worker"
+entrypoint = "AlcRedactEntrypoint"
+
+# 黒塗りの終わりの WS の push (src/bus.rs): nuxt-notify の notify-realtime-bus の POST /broadcast。staging は -staging
+[[services]]
+binding = "NOTIFY_REALTIME_BUS"
+service = "notify-realtime-bus"
+
+# realtime-bus の /broadcast の X-Broadcast-Secret (realtime-bus と同じ Secrets Store の secret。値は repo に無い)。
+# consumer でだけ引く。staging は staging の secret (realtime-bus の staging と同じ)
+[[secrets_store_secrets]]
+binding = "NOTIFY_REDACT_BROADCAST_SECRET"
+store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
+secret_name = "notify-redact-broadcast-secret"
+
 # staging: DB は ippoan/alc-vein-worker の staging と同じもの (Workers VPC の binding NOTIFY_DB_VPC から
 # 既存の Tunnel 経由で PgBouncer へ繋ぐ。src/db.rs)。Hyperdrive は通さない。
 [env.staging]
@@ -129,6 +161,29 @@ secret_name = "cf-email-routing-token"
 [[env.staging.r2_buckets]]
 binding = "NOTIFY_R2"
 bucket_name = "notify-files-staging"
+
+[[env.staging.queues.producers]]
+binding = "NOTIFY_DOCS_QUEUE"
+queue = "notify-docs-staging"
+
+[[env.staging.queues.consumers]]
+queue = "notify-docs-staging"
+max_batch_size = 1
+max_retries = 3
+
+[[env.staging.services]]
+binding = "ALC_REDACT"
+service = "auth-worker-staging"
+entrypoint = "AlcRedactEntrypoint"
+
+[[env.staging.services]]
+binding = "NOTIFY_REALTIME_BUS"
+service = "notify-realtime-bus-staging"
+
+[[env.staging.secrets_store_secrets]]
+binding = "NOTIFY_REDACT_BROADCAST_SECRET"
+store_id = "bd7bc91a3e5f4111add4acf6cb4b8733"
+secret_name = "notify-redact-broadcast-secret-staging"
 
 [env.staging.vars]
 NOTIFY_FRONTEND_URL = "https://notify-staging.ippoan.org"

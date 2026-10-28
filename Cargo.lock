@@ -57,6 +57,7 @@ dependencies = [
  "alc-worker-db",
  "axum",
  "futures-util",
+ "js-sys",
  "notify",
  "tokio-postgres",
  "tower-service",
