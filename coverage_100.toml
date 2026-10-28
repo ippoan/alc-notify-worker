@@ -5,7 +5,7 @@
 #   NOTIFY_TEST_ADMIN_DATABASE_URL=... cargo llvm-cov --locked -p notify --text > cov-notify.txt
 #   bash scripts/check_coverage_100.sh --use-cache cov-notify.txt
 #
-# 計測するのは `cargo test -p notify` の全部 = 単体テストと tests/recipients_db.rs・tests/lineworks_db.rs・tests/distribute_db.rs (口から実 DB まで。接続先が無ければ失敗する。
+# 計測するのは `cargo test -p notify` の全部 = 単体テストと tests/recipients_db.rs・tests/lineworks_db.rs・tests/distribute_db.rs・tests/inbound_db.rs (口から実 DB まで。接続先が無ければ失敗する。
 # lineworks-worker・LINE・viewer はモック)。
 # worker 本体 (直下の src/、wasm 専用) は native で計測できないので対象外。
 
@@ -56,3 +56,11 @@ path = "crates/notify/src/http.rs"
 # Cloudflare Email Routing の送り先 (宛先のメールアドレスの登録と確認の状態。API はモック)
 [[files]]
 path = "crates/notify/src/email_routing.rs"
+
+# LINE の webhook の受け口 (署名の照合・follow で宛先を作る。tests/inbound_db.rs が実 DB で通す。LINE はモック)
+[[files]]
+path = "crates/notify/src/line_webhook.rs"
+
+# LINE WORKS の webhook の受け口 (bot-secret・event。tests/inbound_db.rs が実 DB で通す)
+[[files]]
+path = "crates/notify/src/lineworks_webhook.rs"

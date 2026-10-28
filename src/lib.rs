@@ -6,7 +6,7 @@
 //! `routes` を持たない)、入口は auth-worker からの Service Binding だけ (wrangler.toml と scripts/check-exposure.sh が保証する)。
 //!
 //! LINE WORKS の API は ippoan/alc-lineworks-worker を Service Binding `ALC_LINEWORKS` で呼ぶ ([`lineworks`])。
-//! 秘密値 `SSO_ENCRYPTION_KEY` (Secrets Store) は line-config の POST と配信の口でだけ、`INTERNAL_SHARED_SECRET`
+//! 秘密値 `SSO_ENCRYPTION_KEY` (Secrets Store) は line-config の POST・LINE の webhook・配信の口でだけ、`INTERNAL_SHARED_SECRET`
 //! (Secrets Store、viewer の register-view の認証) は配信の口でだけ引く。`CF_EMAIL_ROUTING_TOKEN` (Secrets Store) と
 //! `CF_ACCOUNT_ID` (`[vars]`) (Cloudflare Email Routing の送り先の登録) は宛先の保存と email-status の口でだけ引く ([`email_routing`])。配信の外への POST (LINE・viewer) は [`http`]。
 
@@ -29,6 +29,7 @@ use notify::distribute::{is_distribute_request, Outbound};
 use notify::email_routing::{needs_email_routing, EmailRoutingApi};
 use notify::line::{LineEndpoints, LineTokenCache};
 use notify::line_config::LINE_CONFIG_PATH;
+use notify::line_webhook::LINE_WEBHOOK_PATH;
 use notify::lineworks::LineworksApi;
 use notify::{router, LogSink, NotifyState};
 use tower_service::Service;
@@ -40,7 +41,8 @@ use crate::email_routing::{CloudflareEmailRouting, NoEmailRouting};
 use crate::http::WorkerHttp;
 use crate::lineworks::{LineworksBinding, NoLineworks};
 
-/// line-config の秘密値の暗号化の鍵 (Secrets Store。auth-worker・alc-lineworks-worker と同じ secret)
+/// line-config の秘密値の暗号化の鍵 (Secrets Store。auth-worker・alc-lineworks-worker と同じ secret)。LINE の webhook の
+/// 署名の照合 (channel secret の復号) にも使う
 const SSO_ENCRYPTION_KEY_BINDING: &str = "SSO_ENCRYPTION_KEY";
 /// ippoan/alc-lineworks-worker の Service Binding
 const ALC_LINEWORKS_BINDING: &str = "ALC_LINEWORKS";
@@ -134,14 +136,16 @@ async fn fetch(req: HttpRequest, env: Env, _ctx: Context) -> Result<Response<Bod
             ));
         }
     };
-    // 秘密値を引くのは line-config の POST と配信の口だけ (ほかの口では Secrets Store を読まない)
+    // 秘密値を引くのは line-config の POST・LINE の webhook・配信の口だけ (ほかの口では Secrets Store を読まない)
     let post = req.method() == Method::POST;
     let distributing = is_distribute_request(post, req.uri().path());
-    let sso_key = if distributing || (post && req.uri().path() == LINE_CONFIG_PATH) {
-        secret(&env, SSO_ENCRYPTION_KEY_BINDING).await
-    } else {
-        None
-    };
+    let path = req.uri().path();
+    let sso_key =
+        if distributing || (post && (path == LINE_CONFIG_PATH || path == LINE_WEBHOOK_PATH)) {
+            secret(&env, SSO_ENCRYPTION_KEY_BINDING).await
+        } else {
+            None
+        };
     let viewer_secret = if distributing {
         secret(&env, INTERNAL_SHARED_SECRET_BINDING).await
     } else {

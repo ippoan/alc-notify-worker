@@ -237,6 +237,41 @@ pub mod sql {
     /// `error_message` は固定の語だけ (上流の本文・宛先を入れない)
     pub const MARK_FAILED: &str = "UPDATE notify_deliveries SET status = 'failed', \
          error_message = $1, attempt = attempt + 1 WHERE tenant_id = $2 AND id = $3";
+
+    // ---- LINE・LINE WORKS の受け口 (rust の `line_webhook.rs` の find_config_by_signature・`repo/notify_recipients.rs` の
+    //      upsert_by_line_user_id・`repo/lineworks_channels.rs` の upsert_joined / mark_left / lookup_bot_config_for_webhook) ----
+
+    /// 全テナントの有効な LINE の設定 (SECURITY DEFINER の関数、migration 117。nil のテナントの transaction で呼ぶ)
+    pub const LIST_ENABLED_LINE_CONFIGS: &str =
+        "SELECT tenant_id, channel_id, channel_secret_encrypted, key_id, \
+         private_key_encrypted FROM alc_api.list_enabled_line_configs()";
+
+    /// LINE の follow で宛先を作る・名前を更新する
+    pub const UPSERT_LINE_RECIPIENT: &str =
+        "INSERT INTO notify_recipients (tenant_id, name, provider, line_user_id) \
+         VALUES ($1, $2, 'line', $3) \
+         ON CONFLICT (tenant_id, line_user_id) WHERE line_user_id IS NOT NULL \
+         DO UPDATE SET name = EXCLUDED.name, updated_at = NOW()";
+
+    /// LINE WORKS の bot_id → (bot_configs の行 id, tenant, 暗号化済みの bot_secret) (SECURITY DEFINER の関数、migration 102。
+    /// nil のテナントの transaction で呼ぶ)
+    pub const LOOKUP_BOT_FOR_WEBHOOK: &str = "SELECT id, tenant_id, bot_secret_encrypted \
+         FROM alc_api.lookup_bot_config_for_webhook($1)";
+
+    /// Bot がトークルームに招かれた
+    pub const UPSERT_JOINED_CHANNEL: &str = "INSERT INTO lineworks_channels \
+         (tenant_id, bot_config_id, channel_id, channel_type, title, active, joined_at) \
+         VALUES ($1, $2, $3, $4, $5, TRUE, NOW()) \
+         ON CONFLICT (bot_config_id, channel_id) DO UPDATE SET \
+           active = TRUE, joined_at = NOW(), \
+           channel_type = COALESCE(EXCLUDED.channel_type, lineworks_channels.channel_type), \
+           title = COALESCE(EXCLUDED.title, lineworks_channels.title), \
+           updated_at = NOW()";
+
+    /// Bot がトークルームから外れた
+    pub const MARK_LEFT_CHANNEL: &str =
+        "UPDATE lineworks_channels SET active = FALSE, updated_at = NOW() \
+         WHERE tenant_id = $1 AND bot_config_id = $2 AND channel_id = $3";
 }
 
 /// rust の `alc_core::repository::notify_recipients::NotifyRecipient` と同じ JSON
@@ -1236,6 +1271,143 @@ pub async fn mark_failed(
                     (&reason, Type::TEXT),
                     (&tenant_id, Type::UUID),
                     (&id, Type::UUID),
+                ],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// LINE の webhook の署名の照合に使う設定 (秘密値は暗号文のまま)
+#[derive(Clone)]
+pub struct LineConfigForWebhook {
+    pub tenant_id: Uuid,
+    pub channel_id: String,
+    pub channel_secret_encrypted: String,
+    pub key_id: Option<String>,
+    pub private_key_encrypted: Option<String>,
+}
+
+impl TxOutput for LineConfigForWebhook {}
+
+/// 全テナントの有効な LINE の設定 (テナントが決まる前。nil のテナントの transaction で SECURITY DEFINER の関数だけを呼ぶ)
+pub async fn list_enabled_line_configs(
+    pg: &mut PgClient,
+) -> Result<Vec<LineConfigForWebhook>, Error> {
+    pg.tenant_tx(Uuid::nil(), |tx| {
+        Box::pin(async move {
+            let rows = tx.query_typed(sql::LIST_ENABLED_LINE_CONFIGS, &[]).await?;
+            Ok(rows
+                .iter()
+                .map(|r| LineConfigForWebhook {
+                    tenant_id: r.get(0),
+                    channel_id: r.get(1),
+                    channel_secret_encrypted: r.get(2),
+                    key_id: r.get(3),
+                    private_key_encrypted: r.get(4),
+                })
+                .collect())
+        })
+    })
+    .await
+}
+
+pub async fn upsert_line_recipient(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    line_user_id: String,
+    name: String,
+) -> Result<(), Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            tx.execute_typed(
+                sql::UPSERT_LINE_RECIPIENT,
+                &[
+                    (&tenant_id, Type::UUID),
+                    (&name, Type::TEXT),
+                    (&line_user_id, Type::TEXT),
+                ],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+}
+
+/// LINE WORKS の webhook が bot_id から引く bot の設定
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotForWebhook {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub bot_secret_encrypted: Option<String>,
+}
+
+impl TxOutput for BotForWebhook {}
+
+/// bot_id → 有効な bot の設定 (テナントが決まる前。nil のテナントの transaction で SECURITY DEFINER の関数だけを呼ぶ)
+pub async fn lookup_bot_for_webhook(
+    pg: &mut PgClient,
+    bot_id: String,
+) -> Result<Option<BotForWebhook>, Error> {
+    pg.tenant_tx(Uuid::nil(), move |tx| {
+        Box::pin(async move {
+            let row = tx
+                .query_typed_opt(sql::LOOKUP_BOT_FOR_WEBHOOK, &[(&bot_id, Type::TEXT)])
+                .await?;
+            Ok(row.map(|r| BotForWebhook {
+                id: r.get(0),
+                tenant_id: r.get(1),
+                bot_secret_encrypted: r.get(2),
+            }))
+        })
+    })
+    .await
+}
+
+pub async fn upsert_joined_channel(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    bot_config_id: Uuid,
+    channel_id: String,
+    channel_type: Option<String>,
+    title: Option<String>,
+) -> Result<(), Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            tx.execute_typed(
+                sql::UPSERT_JOINED_CHANNEL,
+                &[
+                    (&tenant_id, Type::UUID),
+                    (&bot_config_id, Type::UUID),
+                    (&channel_id, Type::TEXT),
+                    (&channel_type, Type::TEXT),
+                    (&title, Type::TEXT),
+                ],
+            )
+            .await?;
+            Ok(())
+        })
+    })
+    .await
+}
+
+pub async fn mark_left_channel(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    bot_config_id: Uuid,
+    channel_id: String,
+) -> Result<(), Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            tx.execute_typed(
+                sql::MARK_LEFT_CHANNEL,
+                &[
+                    (&tenant_id, Type::UUID),
+                    (&bot_config_id, Type::UUID),
+                    (&channel_id, Type::TEXT),
                 ],
             )
             .await?;
