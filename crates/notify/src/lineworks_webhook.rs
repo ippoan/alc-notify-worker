@@ -12,24 +12,44 @@
 //! | POST | `/api/internal/lineworks/event` | 200 `{"ok": true}` (`join`/`joined` → トークルームを足す、`leave`/`left` → 外す、ほかと `channel_id` なしは何もしない) | 404 `bot_not_found` / 500 `lookup_failed`・`upsert_failed`・`mark_left_failed` |
 //!
 //! rust との違い: 外す (`leave`) の UPDATE は `WHERE tenant_id` でも絞る (RLS の下では同じ行になる)。
+//!
+//! ## tenant 付きの 2 本 (rust に無い口)
+//!
+//! `GET /api/internal/lineworks/tenant/bot-secret/{bot_id}`・`POST /api/internal/lineworks/tenant/event`。応答・失敗の語は上の 2 本と同じ。
+//! auth-worker が callback URL の識別子 (tenant と bot_id を暗号化したもの) を復号し、tenant を `X-Tenant-ID` で付けて呼ぶ。
+//! tenant の layer の中に置き ([`tenant_router`]。無い・UUID でない → 401)、bot はその tenant の transaction の中で RLS のまま引く
+//! ([`pg::lookup_tenant_bot_for_webhook`])。tenant をまたぐ SECURITY DEFINER の関数を通さないための経路で、上の 2 本は
+//! callback URL が切り替わるまで残す。
 
 use alc_core_wasm::api_error::{internal_error_msg, not_found, ApiError};
+use alc_core_wasm::TenantId;
 use axum::extract::{Path, State};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use uuid::Uuid;
 
 use crate::pg::{self, BotForWebhook};
 use crate::NotifyState;
 
 pub const BOT_SECRET_PATH: &str = "/api/internal/lineworks/bot-secret/{bot_id}";
 pub const EVENT_PATH: &str = "/api/internal/lineworks/event";
+pub const TENANT_BOT_SECRET_PATH: &str = "/api/internal/lineworks/tenant/bot-secret/{bot_id}";
+pub const TENANT_EVENT_PATH: &str = "/api/internal/lineworks/tenant/event";
 
+/// tenant のヘッダーを持たない 2 本 (tenant の layer の外)
 pub fn router() -> Router<NotifyState> {
     Router::new()
         .route(BOT_SECRET_PATH, get(bot_secret))
         .route(EVENT_PATH, post(event))
+}
+
+/// tenant 付きの 2 本 (tenant の layer の中に置く)
+pub fn tenant_router() -> Router<NotifyState> {
+    Router::new()
+        .route(TENANT_BOT_SECRET_PATH, get(tenant_bot_secret))
+        .route(TENANT_EVENT_PATH, post(tenant_event))
 }
 
 #[derive(Debug, Serialize)]
@@ -47,10 +67,18 @@ pub struct EventBody {
     pub title: Option<String>,
 }
 
-async fn lookup(state: &NotifyState, bot_id: String) -> Result<BotForWebhook, ApiError> {
+/// bot_id → 有効な bot。tenant が分かっていればその tenant の中で、無ければ tenant をまたぐ関数で引く
+async fn lookup(
+    state: &NotifyState,
+    tenant: Option<Uuid>,
+    bot_id: String,
+) -> Result<BotForWebhook, ApiError> {
     let mut pg = state.pg.lock().await;
-    pg::lookup_bot_for_webhook(&mut pg, bot_id)
-        .await
+    let found = match tenant {
+        Some(t) => pg::lookup_tenant_bot_for_webhook(&mut pg, t, bot_id).await,
+        None => pg::lookup_bot_for_webhook(&mut pg, bot_id).await,
+    };
+    found
         .map_err(|e| {
             state.db_fail("lookup lineworks bot", &e);
             internal_error_msg("lookup_failed")
@@ -62,7 +90,23 @@ async fn bot_secret(
     State(state): State<NotifyState>,
     Path(bot_id): Path<String>,
 ) -> Result<Json<BotSecretResponse>, ApiError> {
-    let bot = lookup(&state, bot_id).await?;
+    secret_of(&state, None, bot_id).await
+}
+
+async fn tenant_bot_secret(
+    State(state): State<NotifyState>,
+    Extension(TenantId(tenant)): Extension<TenantId>,
+    Path(bot_id): Path<String>,
+) -> Result<Json<BotSecretResponse>, ApiError> {
+    secret_of(&state, Some(tenant), bot_id).await
+}
+
+async fn secret_of(
+    state: &NotifyState,
+    tenant: Option<Uuid>,
+    bot_id: String,
+) -> Result<Json<BotSecretResponse>, ApiError> {
+    let bot = lookup(state, tenant, bot_id).await?;
     let bot_secret_encrypted = bot
         .bot_secret_encrypted
         .ok_or_else(|| not_found("bot_secret_not_configured"))?;
@@ -75,7 +119,23 @@ async fn event(
     State(state): State<NotifyState>,
     Json(body): Json<EventBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let bot = lookup(&state, body.bot_id).await?;
+    apply_event(state, None, body).await
+}
+
+async fn tenant_event(
+    State(state): State<NotifyState>,
+    Extension(TenantId(tenant)): Extension<TenantId>,
+    Json(body): Json<EventBody>,
+) -> Result<Json<Value>, ApiError> {
+    apply_event(state, Some(tenant), body).await
+}
+
+async fn apply_event(
+    state: NotifyState,
+    tenant: Option<Uuid>,
+    body: EventBody,
+) -> Result<Json<Value>, ApiError> {
+    let bot = lookup(&state, tenant, body.bot_id).await?;
     let Some(channel_id) = body.channel_id else {
         return Ok(Json(json!({"ok": true})));
     };
