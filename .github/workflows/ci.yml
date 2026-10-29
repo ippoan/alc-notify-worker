@@ -81,7 +81,7 @@ jobs:
           awk '/Running tests\/distribute_db\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/notify-test.txt" \
             | grep -Eq '^test result: ok\. 10 passed; 0 failed; 0 ignored'
           awk '/Running tests\/inbound_db\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/notify-test.txt" \
-            | grep -Eq '^test result: ok\. 12 passed; 0 failed; 0 ignored'
+            | grep -Eq '^test result: ok\. 11 passed; 0 failed; 0 ignored'
           awk '/Running tests\/documents_db\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/notify-test.txt" \
             | grep -Eq '^test result: ok\. 9 passed; 0 failed; 0 ignored'
           awk '/Running tests\/background_db\.rs \(/{f=1} f && /^test result:/{print; exit}' "$RUNNER_TEMP/notify-test.txt" \

@@ -112,9 +112,8 @@ pub fn router() -> Router<NotifyState> {
         .merge(documents::router())
         .merge(recompute::router())
         .merge(intake::upload_router())
-        .merge(lineworks_webhook::tenant_router())
+        .merge(lineworks_webhook::router())
         .route_layer(middleware::from_fn(require_tenant_header))
         .merge(intake::ingest_router())
         .merge(line_webhook::router())
-        .merge(lineworks_webhook::router())
 }

@@ -364,7 +364,7 @@ pub mod sql {
          error_message = $1, attempt = attempt + 1 WHERE tenant_id = $2 AND id = $3";
 
     // ---- LINE・LINE WORKS の受け口 (rust の `line_webhook.rs` の find_config_by_signature・`repo/notify_recipients.rs` の
-    //      upsert_by_line_user_id・`repo/lineworks_channels.rs` の upsert_joined / mark_left / lookup_bot_config_for_webhook) ----
+    //      upsert_by_line_user_id・`repo/lineworks_channels.rs` の upsert_joined / mark_left) ----
 
     /// 全テナントの有効な LINE の設定 (SECURITY DEFINER の関数、migration 117。nil のテナントの transaction で呼ぶ)
     pub const LIST_ENABLED_LINE_CONFIGS: &str =
@@ -378,13 +378,9 @@ pub mod sql {
          ON CONFLICT (tenant_id, line_user_id) WHERE line_user_id IS NOT NULL \
          DO UPDATE SET name = EXCLUDED.name, updated_at = NOW()";
 
-    /// LINE WORKS の bot_id → (bot_configs の行 id, tenant, 暗号化済みの bot_secret) (SECURITY DEFINER の関数、migration 102。
-    /// nil のテナントの transaction で呼ぶ)
-    pub const LOOKUP_BOT_FOR_WEBHOOK: &str = "SELECT id, tenant_id, bot_secret_encrypted \
-         FROM alc_api.lookup_bot_config_for_webhook($1)";
-
-    /// tenant が分かっている webhook (auth-worker が callback URL の識別子から tenant を復号して付ける) の bot の引き当て。
-    /// 関数を通さず、その tenant の transaction の中で RLS のまま読む (条件は関数と同じ。同じ bot_id が 2 行あれば id の順で最初)
+    /// LINE WORKS の webhook (auth-worker が callback URL の識別子から tenant を復号して付ける) の bot の引き当て:
+    /// (tenant, bot_id) → (bot_configs の行 id, tenant, 暗号化済みの bot_secret)。その tenant の transaction の中で RLS のまま読む
+    /// (条件は rust の `lookup_bot_config_for_webhook` (migration 102) と同じ。同じ bot_id が 2 行あれば id の順で最初)
     pub const LOOKUP_TENANT_BOT_FOR_WEBHOOK: &str = "SELECT id, tenant_id, bot_secret_encrypted \
          FROM bot_configs WHERE tenant_id = $1 AND bot_id = $2 AND enabled = TRUE ORDER BY id LIMIT 1";
 
@@ -1714,22 +1710,6 @@ pub struct BotForWebhook {
 }
 
 impl TxOutput for BotForWebhook {}
-
-/// bot_id → 有効な bot の設定 (テナントが決まる前。nil のテナントの transaction で SECURITY DEFINER の関数だけを呼ぶ)
-pub async fn lookup_bot_for_webhook(
-    pg: &mut PgClient,
-    bot_id: String,
-) -> Result<Option<BotForWebhook>, Error> {
-    pg.tenant_tx(Uuid::nil(), move |tx| {
-        Box::pin(async move {
-            let row = tx
-                .query_typed_opt(sql::LOOKUP_BOT_FOR_WEBHOOK, &[(&bot_id, Type::TEXT)])
-                .await?;
-            Ok(row.as_ref().map(bot_for_webhook))
-        })
-    })
-    .await
-}
 
 /// (tenant, bot_id) → その tenant の有効な bot の設定 (tenant の transaction で RLS のまま読む)
 pub async fn lookup_tenant_bot_for_webhook(
