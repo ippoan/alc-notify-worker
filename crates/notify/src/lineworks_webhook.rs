@@ -20,6 +20,12 @@
 //! tenant の layer の中に置き ([`tenant_router`]。無い・UUID でない → 401)、bot はその tenant の transaction の中で RLS のまま引く
 //! ([`pg::lookup_tenant_bot_for_webhook`])。tenant をまたぐ SECURITY DEFINER の関数を通さないための経路で、上の 2 本は
 //! callback URL が切り替わるまで残す。
+//!
+//! ## トークルームの名前 (rust に無い)
+//!
+//! LINE WORKS の招待のイベント (`join`/`joined`) はトークルームの名前を持たない。名前 (`title`) が無ければ、足す前に
+//! lineworks-worker の `GET /api/internal/lineworks/channel-info` (そのトークルームに居る bot) で引いて入れる。
+//! 取れなければ名前なしのまま足す (best-effort。ログは固定の語と status / 届かない理由の label だけ)。
 
 use alc_core_wasm::api_error::{internal_error_msg, not_found, ApiError};
 use alc_core_wasm::TenantId;
@@ -30,8 +36,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use crate::line::form_urlencode;
+use crate::lineworks::{LwRequest, LwUnreachable};
 use crate::pg::{self, BotForWebhook};
 use crate::NotifyState;
+
+/// lineworks-worker のトークルームの名前の口 (path は lineworks-worker の `crates/lineworks/src/routes.rs` と同じ)
+pub const LW_CHANNEL_INFO_PATH: &str = "/api/internal/lineworks/channel-info";
 
 pub const BOT_SECRET_PATH: &str = "/api/internal/lineworks/bot-secret/{bot_id}";
 pub const EVENT_PATH: &str = "/api/internal/lineworks/event";
@@ -139,6 +150,11 @@ async fn apply_event(
     let Some(channel_id) = body.channel_id else {
         return Ok(Json(json!({"ok": true})));
     };
+    let joined = matches!(body.event_type.as_str(), "join" | "joined");
+    let title = match body.title {
+        None if joined => channel_title(&state, &bot, &channel_id).await,
+        t => t,
+    };
     let mut pg = state.pg.lock().await;
     match body.event_type.as_str() {
         "join" | "joined" => pg::upsert_joined_channel(
@@ -147,7 +163,7 @@ async fn apply_event(
             bot.id,
             channel_id,
             body.channel_type,
-            body.title,
+            title,
         )
         .await
         .map_err(|e| {
@@ -163,4 +179,40 @@ async fn apply_event(
         _ => {}
     }
     Ok(Json(json!({"ok": true})))
+}
+
+/// トークルームの名前を lineworks-worker で引く (そのトークルームに居る bot・その tenant)。取れなければ `None`
+async fn channel_title(
+    state: &NotifyState,
+    bot: &BotForWebhook,
+    channel_id: &str,
+) -> Option<String> {
+    let bot_config_id = bot.id.to_string();
+    let query = form_urlencode(&[
+        ("channel_id", channel_id),
+        ("bot_config_id", &bot_config_id),
+    ]);
+    let req = LwRequest {
+        post: false,
+        path: format!("{LW_CHANNEL_INFO_PATH}?{query}"),
+        tenant_id: bot.tenant_id,
+        body: None,
+    };
+    match state.lineworks.call(req).await {
+        Ok(r) if (200..300).contains(&r.status) => {
+            let v: Value = serde_json::from_slice(&r.body).ok()?;
+            v.get("title")?.as_str().map(str::to_owned)
+        }
+        Ok(r) => {
+            (state.log)(&format!(
+                "notify: lineworks channel title failed: status {}",
+                r.status
+            ));
+            None
+        }
+        Err(LwUnreachable(label)) => {
+            (state.log)(&format!("notify: lineworks channel title failed: {label}"));
+            None
+        }
+    }
 }
