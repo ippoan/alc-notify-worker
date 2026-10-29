@@ -152,7 +152,7 @@ fn percent_encode(s: &str) -> String {
 }
 
 /// `application/x-www-form-urlencoded`
-fn form_urlencode(pairs: &[(&str, &str)]) -> String {
+pub(crate) fn form_urlencode(pairs: &[(&str, &str)]) -> String {
     pairs
         .iter()
         .map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v)))

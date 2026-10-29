@@ -697,3 +697,63 @@ async fn inbound_routes_are_outside_the_tenant_layer() {
         401
     );
 }
+
+/// 招待のイベントに名前が無ければ、lineworks-worker の channel-info (そのトークルームの bot・その tenant) で引いて入れる。
+/// イベントに名前があれば引かない。引けなければ名前なしのまま足し、ログは固定の語と status / label だけ
+#[tokio::test]
+async fn joined_without_title_fetches_the_channel_name() {
+    let t = tenant().await;
+    let (bot_row, bot_id) = bot(t, Some("enc"), true).await;
+    let app = app().await;
+    let send = |v: Value| call(&app, "POST", TENANT_EVENT, Some(t), Some(v));
+
+    app.lineworks
+        .reply(200, r#"{"title":"勤怠通知"}"#.as_bytes());
+    let got = send(json!({"bot_id": bot_id, "event_type": "joined", "channel_id": "ch a/1"})).await;
+    assert_eq!(got.json(), json!({"ok": true}));
+    let calls = app.lineworks.calls();
+    assert_eq!(calls.len(), 1);
+    assert!(!calls[0].post);
+    assert_eq!(calls[0].tenant_id, t);
+    assert_eq!(
+        calls[0].path,
+        format!(
+            "/api/internal/lineworks/channel-info?channel_id=ch%20a%2F1&bot_config_id={bot_row}"
+        )
+    );
+
+    // 名前があれば引かない
+    send(json!({"bot_id": bot_id, "event_type": "join", "channel_id": "ch-b", "title": "配車"}))
+        .await;
+    assert_eq!(app.lineworks.calls().len(), 1);
+    // 引けない: 上流の失敗・届かない・名前が無い応答
+    app.lineworks.reply(502, br#"{"error":"upstream_error"}"#);
+    send(json!({"bot_id": bot_id, "event_type": "joined", "channel_id": "ch-c"})).await;
+    app.lineworks.unreachable("fetch");
+    send(json!({"bot_id": bot_id, "event_type": "joined", "channel_id": "ch-d"})).await;
+    app.lineworks.reply(200, br#"{"title":null}"#);
+    send(json!({"bot_id": bot_id, "event_type": "joined", "channel_id": "ch-e"})).await;
+
+    let titles: Vec<(String, Option<String>)> = channels(bot_row)
+        .await
+        .into_iter()
+        .map(|(c, _, title, _, _)| (c, title))
+        .collect();
+    assert_eq!(
+        titles,
+        vec![
+            ("ch a/1".into(), Some("勤怠通知".into())),
+            ("ch-b".into(), Some("配車".into())),
+            ("ch-c".into(), None),
+            ("ch-d".into(), None),
+            ("ch-e".into(), None),
+        ]
+    );
+    assert_eq!(
+        app.logs(),
+        vec![
+            "notify: lineworks channel title failed: status 502".to_owned(),
+            "notify: lineworks channel title failed: fetch".to_owned(),
+        ]
+    );
+}
