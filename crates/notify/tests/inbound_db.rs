@@ -20,8 +20,6 @@ use tower::ServiceExt;
 use uuid::Uuid;
 
 const LINE_WEBHOOK: &str = "/api/internal/notify/line/webhook";
-const BOT_SECRET: &str = "/api/internal/lineworks/bot-secret";
-const EVENT: &str = "/api/internal/lineworks/event";
 const TENANT_BOT_SECRET: &str = "/api/internal/lineworks/tenant/bot-secret";
 const TENANT_EVENT: &str = "/api/internal/lineworks/tenant/event";
 
@@ -361,64 +359,11 @@ async fn channels(bot: Uuid) -> Vec<(String, Option<String>, Option<String>, boo
 }
 
 #[tokio::test]
-async fn bot_secret_returns_encrypted_secret() {
-    let t = tenant().await;
-    let (_, with_secret) = bot(t, Some("enc-secret"), true).await;
-    let (_, without_secret) = bot(t, None, true).await;
-    let (_, disabled) = bot(t, Some("enc"), false).await;
-    let app = app().await;
-
-    let got = call(
-        &app,
-        "GET",
-        &format!("{BOT_SECRET}/{with_secret}"),
-        None,
-        None,
-    )
-    .await;
-    assert_eq!(got.status, 200);
-    assert_eq!(got.json(), json!({"bot_secret_encrypted": "enc-secret"}));
-
-    let got = call(
-        &app,
-        "GET",
-        &format!("{BOT_SECRET}/{without_secret}"),
-        None,
-        None,
-    )
-    .await;
-    assert_eq!(got.status, 404);
-    assert_eq!(got.json(), json!({"error": "bot_secret_not_configured"}));
-
-    for missing in [disabled, "bot-unknown".to_owned()] {
-        let got = call(&app, "GET", &format!("{BOT_SECRET}/{missing}"), None, None).await;
-        assert_eq!(got.status, 404);
-        assert_eq!(got.json(), json!({"error": "bot_not_found"}));
-    }
-
-    let broken = broken_app().await;
-    let got = call(
-        &broken,
-        "GET",
-        &format!("{BOT_SECRET}/{with_secret}"),
-        None,
-        None,
-    )
-    .await;
-    assert_eq!(got.status, 500);
-    assert_eq!(
-        got.json(),
-        json!({"error": "internal_error", "message": "lookup_failed"})
-    );
-    assert!(broken.logs()[0].starts_with("notify: lookup lineworks bot failed: db ("));
-}
-
-#[tokio::test]
 async fn event_joins_and_leaves_channels() {
     let t = tenant().await;
     let (bot_row, bot_id) = bot(t, Some("enc"), true).await;
     let app = app().await;
-    let send = |v: Value| call(&app, "POST", EVENT, None, Some(v));
+    let send = |v: Value| call(&app, "POST", TENANT_EVENT, Some(t), Some(v));
 
     let got = send(
         json!({"bot_id": bot_id, "event_type": "joined", "channel_id": "ch-a",
@@ -502,8 +447,8 @@ async fn event_db_failures() {
     let got = call(
         &broken,
         "POST",
-        EVENT,
-        None,
+        TENANT_EVENT,
+        Some(t),
         Some(json!({"bot_id": bot_id, "event_type": "joined", "channel_id": "x"})),
     )
     .await;
@@ -529,8 +474,8 @@ async fn event_db_failures() {
         call(
             &app,
             "POST",
-            EVENT,
-            None,
+            TENANT_EVENT,
+            Some(t),
             Some(json!({"bot_id": bot_id, "event_type": ev, "channel_id": "notify-test-fail"})),
         )
     };
@@ -674,22 +619,30 @@ async fn tenant_event_joins_within_the_tenant() {
     assert!(app.logs().is_empty(), "{:?}", app.logs());
 }
 
-/// 受け口は tenant のヘッダーを要らない。ほかの口は今までどおり要る
+/// tenant を持たない旧 2 本 (bot-secret・event) は消した。tenant のヘッダーの有無にかかわらず 404 で、何も書かない
 #[tokio::test]
-async fn inbound_routes_are_outside_the_tenant_layer() {
-    let app = app().await;
-    assert_eq!(
-        call(
-            &app,
+async fn old_routes_without_tenant_are_gone() {
+    let (t, app) = (tenant().await, app().await);
+    let (bot_row, bot_id) = bot(t, Some("enc"), true).await;
+    let old = [
+        (
             "GET",
-            &format!("{BOT_SECRET}/bot-unknown"),
+            format!("/api/internal/lineworks/bot-secret/{bot_id}"),
             None,
-            None
-        )
-        .await
-        .status,
-        404
-    );
+        ),
+        (
+            "POST",
+            "/api/internal/lineworks/event".to_owned(),
+            Some(json!({"bot_id": bot_id, "event_type": "joined", "channel_id": "x"})),
+        ),
+    ];
+    for (method, uri, body) in old {
+        for tenant in [None, Some(t)] {
+            let got = call(&app, method, &uri, tenant, body.clone()).await;
+            assert_eq!(got.status, 404);
+        }
+    }
+    assert!(channels(bot_row).await.is_empty());
     assert_eq!(
         call(&app, "GET", "/api/notify/recipients", None, None)
             .await
