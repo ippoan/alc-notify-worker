@@ -12,7 +12,8 @@
 //!   Cloudflare の API は [`email_routing::EmailRoutingApi`])
 //! - [`line_webhook`] — LINE の webhook の受け口 (`POST /api/internal/notify/line/webhook`。auth-worker が raw body と署名を渡す)
 //! - [`lineworks_webhook`] — LINE WORKS の webhook の受け口 (`GET /api/internal/lineworks/bot-secret/{bot_id}`・
-//!   `POST /api/internal/lineworks/event`。auth-worker の Durable Object が呼ぶ)
+//!   `POST /api/internal/lineworks/event`。auth-worker の Durable Object が呼ぶ。tenant 付きの `/api/internal/lineworks/tenant/…` の
+//!   2 本は tenant の layer の中)
 //! - [`documents`] — 文書とメールの閲覧 (`GET /api/notify/documents`・`/{id}`・`/{id}/preview`・`/{id}/download`・
 //!   `GET /api/notify/emails`・`/{message_id}`)。ファイルは R2 ([`store::FileStore`])。削除 (DELETE) もここ
 //! - [`intake`] — 文書の upload (`POST /api/notify/documents/upload`) とメールの取り込み (`POST /api/notify/ingest`。tenant の
@@ -111,6 +112,7 @@ pub fn router() -> Router<NotifyState> {
         .merge(documents::router())
         .merge(recompute::router())
         .merge(intake::upload_router())
+        .merge(lineworks_webhook::tenant_router())
         .route_layer(middleware::from_fn(require_tenant_header))
         .merge(intake::ingest_router())
         .merge(line_webhook::router())

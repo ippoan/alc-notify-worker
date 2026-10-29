@@ -383,6 +383,11 @@ pub mod sql {
     pub const LOOKUP_BOT_FOR_WEBHOOK: &str = "SELECT id, tenant_id, bot_secret_encrypted \
          FROM alc_api.lookup_bot_config_for_webhook($1)";
 
+    /// tenant が分かっている webhook (auth-worker が callback URL の識別子から tenant を復号して付ける) の bot の引き当て。
+    /// 関数を通さず、その tenant の transaction の中で RLS のまま読む (条件は関数と同じ。同じ bot_id が 2 行あれば id の順で最初)
+    pub const LOOKUP_TENANT_BOT_FOR_WEBHOOK: &str = "SELECT id, tenant_id, bot_secret_encrypted \
+         FROM bot_configs WHERE tenant_id = $1 AND bot_id = $2 AND enabled = TRUE ORDER BY id LIMIT 1";
+
     /// Bot がトークルームに招かれた
     pub const UPSERT_JOINED_CHANNEL: &str = "INSERT INTO lineworks_channels \
          (tenant_id, bot_config_id, channel_id, channel_type, title, active, joined_at) \
@@ -1720,14 +1725,38 @@ pub async fn lookup_bot_for_webhook(
             let row = tx
                 .query_typed_opt(sql::LOOKUP_BOT_FOR_WEBHOOK, &[(&bot_id, Type::TEXT)])
                 .await?;
-            Ok(row.map(|r| BotForWebhook {
-                id: r.get(0),
-                tenant_id: r.get(1),
-                bot_secret_encrypted: r.get(2),
-            }))
+            Ok(row.as_ref().map(bot_for_webhook))
         })
     })
     .await
+}
+
+/// (tenant, bot_id) → その tenant の有効な bot の設定 (tenant の transaction で RLS のまま読む)
+pub async fn lookup_tenant_bot_for_webhook(
+    pg: &mut PgClient,
+    tenant_id: Uuid,
+    bot_id: String,
+) -> Result<Option<BotForWebhook>, Error> {
+    pg.tenant_tx(tenant_id, move |tx| {
+        Box::pin(async move {
+            let row = tx
+                .query_typed_opt(
+                    sql::LOOKUP_TENANT_BOT_FOR_WEBHOOK,
+                    &[(&tenant_id, Type::UUID), (&bot_id, Type::TEXT)],
+                )
+                .await?;
+            Ok(row.as_ref().map(bot_for_webhook))
+        })
+    })
+    .await
+}
+
+fn bot_for_webhook(r: &Row) -> BotForWebhook {
+    BotForWebhook {
+        id: r.get(0),
+        tenant_id: r.get(1),
+        bot_secret_encrypted: r.get(2),
+    }
 }
 
 pub async fn upsert_joined_channel(

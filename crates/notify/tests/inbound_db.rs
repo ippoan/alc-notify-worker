@@ -1,7 +1,7 @@
 //! LINE・LINE WORKS の webhook の受け口 (W8b) を、実 DB (`alc_api_rt` で接続) と LINE のモック (tests/support の `MockHttp`) で通す。
 //! 接続先は `NOTIFY_TEST_ADMIN_DATABASE_URL` (無ければ失敗する。tests/support)。
 //! 期待値は rust-alc-api の `crates/alc-notify/src/line_webhook.rs`・`lineworks_channels.rs` (internal の 2 本)。
-//! どの口も tenant のヘッダーを付けずに打つ (auth-worker が付けない)。
+//! どの口も tenant のヘッダーを付けずに打つ (auth-worker が付けない)。例外は LINE WORKS の tenant 付きの 2 本 (`/tenant/…`)。
 
 mod support;
 
@@ -22,6 +22,8 @@ use uuid::Uuid;
 const LINE_WEBHOOK: &str = "/api/internal/notify/line/webhook";
 const BOT_SECRET: &str = "/api/internal/lineworks/bot-secret";
 const EVENT: &str = "/api/internal/lineworks/event";
+const TENANT_BOT_SECRET: &str = "/api/internal/lineworks/tenant/bot-secret";
+const TENANT_EVENT: &str = "/api/internal/lineworks/tenant/event";
 
 fn test_pem() -> &'static str {
     static PEM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -572,6 +574,104 @@ async fn event_db_failures() {
     assert_eq!(logs.len(), 2, "{logs:?}");
     assert!(logs[0].starts_with("notify: upsert lineworks channel failed: db ("));
     assert!(logs[1].starts_with("notify: mark lineworks channel left failed: db ("));
+}
+
+/// tenant 付きの bot-secret: その tenant の bot だけを引く (別の tenant の bot は 404)。ヘッダーが無ければ 401
+#[tokio::test]
+async fn tenant_bot_secret_is_scoped_to_the_tenant() {
+    let (t, other) = (tenant().await, tenant().await);
+    let (_, with_secret) = bot(t, Some("enc-secret"), true).await;
+    let (_, without_secret) = bot(t, None, true).await;
+    let (_, disabled) = bot(t, Some("enc"), false).await;
+    let app = app().await;
+    let get = |tenant: Option<Uuid>, bot_id: &str| {
+        let (app, uri) = (&app, format!("{TENANT_BOT_SECRET}/{bot_id}"));
+        async move { call(app, "GET", &uri, tenant, None).await }
+    };
+
+    let got = get(Some(t), &with_secret).await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json(), json!({"bot_secret_encrypted": "enc-secret"}));
+
+    let got = get(Some(t), &without_secret).await;
+    assert_eq!(got.status, 404);
+    assert_eq!(got.json(), json!({"error": "bot_secret_not_configured"}));
+
+    for (tenant, bot_id) in [
+        (other, with_secret.as_str()),
+        (t, disabled.as_str()),
+        (t, "bot-unknown"),
+    ] {
+        let got = get(Some(tenant), bot_id).await;
+        assert_eq!(got.status, 404);
+        assert_eq!(got.json(), json!({"error": "bot_not_found"}));
+    }
+    assert_eq!(get(None, &with_secret).await.status, 401);
+    assert!(app.logs().is_empty(), "{:?}", app.logs());
+
+    let broken = broken_app().await;
+    let got = call(
+        &broken,
+        "GET",
+        &format!("{TENANT_BOT_SECRET}/{with_secret}"),
+        Some(t),
+        None,
+    )
+    .await;
+    assert_eq!(got.status, 500);
+    assert_eq!(
+        got.json(),
+        json!({"error": "internal_error", "message": "lookup_failed"})
+    );
+    assert!(broken.logs()[0].starts_with("notify: lookup lineworks bot failed: db ("));
+}
+
+/// tenant 付きの event: その tenant の bot のトークルームだけを足し・外す。別の tenant からは 404 で何も書かない
+#[tokio::test]
+async fn tenant_event_joins_within_the_tenant() {
+    let (t, other) = (tenant().await, tenant().await);
+    let (bot_row, bot_id) = bot(t, Some("enc"), true).await;
+    let app = app().await;
+    let send = |tenant: Option<Uuid>, v: Value| call(&app, "POST", TENANT_EVENT, tenant, Some(v));
+
+    let got = send(
+        Some(t),
+        json!({"bot_id": bot_id, "event_type": "joined", "channel_id": "ch-a", "title": "配車"}),
+    )
+    .await;
+    assert_eq!(got.status, 200);
+    assert_eq!(got.json(), json!({"ok": true}));
+    assert_eq!(
+        channels(bot_row).await,
+        vec![("ch-a".into(), None, Some("配車".into()), true, t)]
+    );
+
+    let got = send(
+        Some(other),
+        json!({"bot_id": bot_id, "event_type": "left", "channel_id": "ch-a"}),
+    )
+    .await;
+    assert_eq!(got.status, 404);
+    assert_eq!(got.json(), json!({"error": "bot_not_found"}));
+    let got = send(
+        None,
+        json!({"bot_id": bot_id, "event_type": "left", "channel_id": "ch-a"}),
+    )
+    .await;
+    assert_eq!(got.status, 401);
+    assert!(
+        channels(bot_row).await[0].3,
+        "別の tenant・ヘッダーなしでは外れない"
+    );
+
+    let got = send(
+        Some(t),
+        json!({"bot_id": bot_id, "event_type": "left", "channel_id": "ch-a"}),
+    )
+    .await;
+    assert_eq!(got.json(), json!({"ok": true}));
+    assert!(!channels(bot_row).await[0].3);
+    assert!(app.logs().is_empty(), "{:?}", app.logs());
 }
 
 /// 受け口は tenant のヘッダーを要らない。ほかの口は今までどおり要る
